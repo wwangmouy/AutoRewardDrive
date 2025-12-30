@@ -1,2 +1,2 @@
 # AutoRewardDrive
-Autonomous driving in CARLA via auto reward function discovery ofd eep reinforcement learning.
+Autonomous driving in CARLA via auto reward function discovery of deep reinforcement learning.
