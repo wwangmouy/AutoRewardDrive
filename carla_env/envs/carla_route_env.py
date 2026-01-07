@@ -330,6 +330,7 @@ class CarlaRouteEnv(gym.Env):
         self.distance_from_center_history = deque(maxlen=30)
 
         self.current_waypoint_index = 0
+        self.prev_waypoint_index = 0 
         self.num_routes_completed += 1
         self.vehicle.set_transform(self.start_wp.transform)
         time.sleep(0.2)
