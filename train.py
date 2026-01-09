@@ -1,4 +1,4 @@
-"""AutoRewardDrive: Automatic Reward Discovery for Autonomous Driving"""
+"""AutoRewardDrive: Training Script"""
 
 import warnings
 import os
@@ -25,7 +25,6 @@ from reward_machine import RewardLearner, Transition
 from sac_agent import AutoRewardDrive_SAC
 from shared_encoder import SharedStateEncoder
 
-# Arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--host", default="localhost", type=str)
 parser.add_argument("--port", default=2000, type=int)
@@ -44,16 +43,19 @@ CONFIG = set_config("default")
 
 def extract_state(obs):
     """Extract BEV and vector state from observation dict"""
-    # BEV: permute (H,W,C) -> (C,H,W) and normalize to [0,1]
     bev = torch.tensor(obs['seg_camera'], dtype=torch.float32).permute(2, 0, 1) / 255.0
     
-    # Vector: concatenate vehicle_measures and waypoints
     vector_parts = []
     if 'vehicle_measures' in obs:
         vector_parts.append(np.array(obs['vehicle_measures']).flatten())
     if 'waypoints' in obs:
         vector_parts.append(np.array(obs['waypoints']).flatten())
+    
+    if not vector_parts:
+        raise ValueError(f"obs missing required keys: need 'vehicle_measures' or 'waypoints', got keys: {list(obs.keys())}")
+    
     vector = torch.tensor(np.concatenate(vector_parts), dtype=torch.float32)
+    assert vector.shape[0] == 34, f"Vector dimension mismatch: expected 34, got {vector.shape[0]}"
     return bev, vector
 
 
@@ -61,7 +63,6 @@ def train():
     os.makedirs(args["log_dir"], exist_ok=True)
     device = args["device"]
     
-    # Create environment
     observation_space, encode_state_fn = create_encode_state_fn(CONFIG.state, CONFIG)
     env = CarlaRouteEnv(
         obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
@@ -73,95 +74,106 @@ def train():
         activate_seg_bev=CONFIG.use_seg_bev, start_carla=args["start_carla"],
     )
     
-    # Create shared encoder
     shared_encoder = SharedStateEncoder(
-        bev_channels=6,
-        vector_dim=34,
-        bev_features=128,
-        vector_features=64
+        bev_channels=6, vector_dim=34, bev_features=128, vector_features=64
     ).to(device)
     
-    # Initialize agent with shared encoder
     agent = AutoRewardDrive_SAC(CONFIG, shared_encoder=shared_encoder, device=device)
-    
-    # Initialize reward learner with shared encoder
     reward_learner = RewardLearner(CONFIG, shared_encoder=shared_encoder, device=device)
     
-    # Logging setup
     log_dir = os.path.join(args["log_dir"], f'AutoRewardDrive_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
     os.makedirs(log_dir, exist_ok=True)
     write_json(CONFIG, os.path.join(log_dir, 'config.json'))
-    
-    # TensorBoard writer
     writer = SummaryWriter(log_dir)
     
-    # Training loop
     obs = env.reset()
     bev, vector = extract_state(obs)
     
     episode_reward = 0
     episode_sparse_reward = 0
+    episode_learned_return = 0
     episode_count = 0
     current_trajectory = []
     pbar = tqdm(range(args["total_timesteps"]), desc="Training", unit="step")
+    
     for step in pbar:
-        # Select action
-        action = agent.select_action(bev.unsqueeze(0), vector.unsqueeze(0))
-        action_np = action.squeeze().numpy()
+        action, log_prob = agent.select_action(bev.unsqueeze(0), vector.unsqueeze(0))
         
-        # Step environment
+        # Standardize actions for storage
+        action = action.squeeze(0)
+        log_prob = log_prob.squeeze(0)
+        
+        action_np = action.cpu().numpy()
+        
         next_obs, sparse_reward, done, info = env.step(action_np)
         next_bev, next_vector = extract_state(next_obs)
         
-        # Get learned reward for training
-        with torch.no_grad():
-            learned_reward = reward_learner.get_reward(
+        # Reward Warmup & Mixing
+        reward_warmup_steps = CONFIG.reward_learning_params.reward_warmup_steps
+        reward_mixing_steps = max(1, CONFIG.reward_learning_params.reward_mixing_steps)
+        
+        if step < reward_warmup_steps:
+            alpha = 0.0
+        else:
+            alpha = min(1.0, (step - reward_warmup_steps) / reward_mixing_steps)
+        
+        learned_reward = 0.0
+        if alpha > 0:
+            learned_reward_tensor = reward_learner.get_reward(
                 bev.unsqueeze(0).to(device),
                 vector.unsqueeze(0).to(device),
-                action.to(device)
+                action.unsqueeze(0).to(device)
             )
+            learned_reward = float(learned_reward_tensor)
         
-        # Store in replay buffer with learned reward
-        agent.replay_buffer.push(bev, vector, action.squeeze(), float(learned_reward), 
+        # Mix rewards: (1 - alpha) * sparse + alpha * learned
+        training_reward = (1.0 - alpha) * sparse_reward + alpha * learned_reward
+        
+        # Push to Replay Buffer
+        agent.replay_buffer.push(bev, vector, action, training_reward, 
                                   next_bev, next_vector, done)
         
-        # Store transition for upper-level
-        transition = Transition(
-            bev_image=bev,
-            vector_state=vector,
-            action=action.squeeze(),
+        # Store for reward learning
+        current_trajectory.append(Transition(
+            bev_image=bev.cpu(),
+            vector_state=vector.cpu(),
+            action=action.cpu(),
             sparse_reward=sparse_reward,
-            log_prob=torch.tensor(0.0),
-            mu=torch.tensor(0.0),
-            overline_V=0.0
-        )
-        current_trajectory.append(transition)
+            log_prob=float(log_prob.item()),
+            overline_V=0.0,
+            next_bev=next_bev.cpu(),
+            next_vector=next_vector.cpu(),
+            done=done
+        ))
         
-        # Update agent (lower-level)
         update_info = None
         if step > CONFIG.algorithm_params.learning_starts:
             update_info = agent.update()
+            reward_learner.update_target_encoder()
         
-        episode_reward += learned_reward
+        episode_reward += training_reward
         episode_sparse_reward += sparse_reward
+        episode_learned_return += learned_reward
         bev, vector = next_bev, next_vector
         
         if done:
             episode_count += 1
             
-            # Store trajectory
-            if len(current_trajectory) > 0:
+            # Store trajectory only if it meets minimum length requirement
+            min_steps = CONFIG.reward_learning_params.min_steps_per_traj
+            if len(current_trajectory) >= min_steps:
                 reward_learner.store_trajectory(current_trajectory)
             current_trajectory = []
             
-            # Upper-level optimization
             reward_loss = None
-            if episode_count % args["upper_update_freq"] == 0:
-                reward_loss = reward_learner.optimize_upper_level(agent)
+            min_trajectories = CONFIG.reward_learning_params.min_trajectories
+            if step >= reward_warmup_steps and len(reward_learner.trajectory_buffer) >= min_trajectories:
+                if episode_count % args["upper_update_freq"] == 0:
+                    reward_loss = reward_learner.optimize_upper_level(agent)
             
-            # TensorBoard logging
-            writer.add_scalar("episode/learned_reward", episode_reward, episode_count)
-            writer.add_scalar("episode/sparse_reward", episode_sparse_reward, episode_count)
+            writer.add_scalar("episode/mixed_return", episode_reward, episode_count)
+            writer.add_scalar("episode/sparse_return", episode_sparse_reward, episode_count)
+            writer.add_scalar("episode/learned_return", episode_learned_return, episode_count)
             writer.add_scalar("episode/length", info.get("episode_length", 0), episode_count)
             writer.add_scalar("episode/distance", info.get("total_distance", 0), episode_count)
             writer.add_scalar("episode/avg_speed", info.get("avg_speed", 0), episode_count)
@@ -175,25 +187,24 @@ def train():
             if reward_loss is not None:
                 writer.add_scalar("losses/reward", reward_loss, episode_count)
             
-            # Update progress bar
             pbar.set_postfix({
                 'ep': episode_count,
                 'reward': f'{episode_reward:.1f}',
                 'dist': f'{info.get("total_distance", 0):.0f}m'
             })
             
-            # Save checkpoint
-            if step % args["save_freq"] == 0:
-                agent.save(os.path.join(log_dir, f'agent_{step}.pth'))
-                reward_learner.save(os.path.join(log_dir, f'reward_{step}.pth'))
-            
-            # Reset
             obs = env.reset()
             bev, vector = extract_state(obs)
             episode_reward = 0
             episode_sparse_reward = 0
+            episode_learned_return = 0
+        
+        # Save checkpoint every save_freq steps (independent of episode boundaries)
+        if step % args["save_freq"] == 0 and step > 0:
+            agent.save(os.path.join(log_dir, f'agent_{step}.pth'))
+            reward_learner.save(os.path.join(log_dir, f'reward_{step}.pth'))
+
     
-    # Final save
     agent.save(os.path.join(log_dir, 'agent_final.pth'))
     reward_learner.save(os.path.join(log_dir, 'reward_final.pth'))
     writer.close()

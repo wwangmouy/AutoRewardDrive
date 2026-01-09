@@ -1,7 +1,4 @@
-"""
-AutoRewardDrive: Reward Network Module
-Neural network for learned reward function R_ω(s, a) using shared encoder
-"""
+"""AutoRewardDrive: Reward Network Module"""
 
 import torch
 import torch.nn as nn
@@ -58,10 +55,7 @@ class ValueHead(nn.Module):
 
 
 class Reward(nn.Module):
-    """
-    Reward network R_ω(s, a) using shared encoder
-    Only contains the reward head, encoder is shared externally
-    """
+    """Reward network R_ω(s, a) using shared encoder"""
     
     def __init__(self, state_feature_dim=192, action_dim=2, hidden_dim=128):
         super().__init__()
@@ -72,10 +66,7 @@ class Reward(nn.Module):
 
 
 class ValueFunction(nn.Module):
-    """
-    Value function V(s) using shared encoder
-    Only contains the value head, encoder is shared externally
-    """
+    """Value function V(s) using shared encoder"""
     
     def __init__(self, state_feature_dim=192, hidden_dim=128):
         super().__init__()

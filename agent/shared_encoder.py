@@ -1,7 +1,4 @@
-"""
-AutoRewardDrive: Shared Encoder Module
-Common BEV encoder shared between policy and reward networks
-"""
+"""AutoRewardDrive: Shared Encoder Module"""
 
 import torch
 import torch.nn as nn
@@ -9,22 +6,21 @@ import torch.nn.functional as F
 
 
 class SharedBEVEncoder(nn.Module):
-    """
-    Shared CNN encoder for BEV semantic images
-    Used by both policy network (SAC) and reward network
-    """
+    """CNN encoder for BEV semantic images with spatial awareness"""
     
     def __init__(self, input_channels=6, features_dim=256):
         super().__init__()
+        # Keep 4x4 spatial resolution to preserve obstacle location info
         self.cnn = nn.Sequential(
             nn.Conv2d(input_channels, 32, 5, stride=2), nn.ReLU(),
             nn.Conv2d(32, 64, 3, stride=2), nn.ReLU(),
             nn.Conv2d(64, 128, 3, stride=2), nn.ReLU(),
             nn.Conv2d(128, 256, 3, stride=2), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
+            nn.AdaptiveAvgPool2d((4, 4)),  # 4x4 spatial grid instead of 1x1
             nn.Flatten(),
         )
-        self.fc = nn.Linear(256, features_dim)
+        # 256 channels * 4 * 4 = 4096
+        self.fc = nn.Linear(256 * 4 * 4, features_dim)
         self.features_dim = features_dim
         self._init_weights()
     
@@ -42,7 +38,7 @@ class SharedBEVEncoder(nn.Module):
 
 
 class SharedVectorEncoder(nn.Module):
-    """Shared MLP encoder for vector observations"""
+    """MLP encoder for vector observations"""
     
     def __init__(self, input_dim=34, hidden_dim=64, output_dim=64):
         super().__init__()
@@ -66,10 +62,7 @@ class SharedVectorEncoder(nn.Module):
 
 
 class SharedStateEncoder(nn.Module):
-    """
-    Combined state encoder (BEV + Vector)
-    Shared across all networks
-    """
+    """Combined state encoder (BEV + Vector)"""
     
     def __init__(self, bev_channels=6, vector_dim=34, bev_features=128, vector_features=64):
         super().__init__()
@@ -83,11 +76,9 @@ class SharedStateEncoder(nn.Module):
         return torch.cat([bev_feat, vec_feat], dim=-1)
     
     def freeze(self):
-        """Freeze encoder weights (for upper-level optimization)"""
         for param in self.parameters():
             param.requires_grad = False
     
     def unfreeze(self):
-        """Unfreeze encoder weights"""
         for param in self.parameters():
             param.requires_grad = True
