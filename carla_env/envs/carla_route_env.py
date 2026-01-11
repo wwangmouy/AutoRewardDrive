@@ -119,7 +119,7 @@ class CarlaRouteEnv(gym.Env):
 
         self.carla_process = None
         if start_carla:
-            CARLA_ROOT = "/home/sky-lab/CARLA_0.9.13"
+            CARLA_ROOT = "/home/wy/CARLA_0.9.13"
             carla_path = os.path.join(CARLA_ROOT, "CarlaUE4.sh")
             launch_command = [carla_path]
             launch_command += ['-quality_level=Low']
