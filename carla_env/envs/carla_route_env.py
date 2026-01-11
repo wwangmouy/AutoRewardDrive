@@ -197,7 +197,7 @@ class CarlaRouteEnv(gym.Env):
         self.world = None
         try:
             self.client = carla.Client(host, port)
-            self.client.set_timeout(5.0)
+            self.client.set_timeout(30.0)  # Increased timeout for initialization
             self.world = World(self.client, town=town)
 
             settings = self.world.get_settings()
@@ -292,7 +292,19 @@ class CarlaRouteEnv(gym.Env):
         self.low_speed_timer = 0.0
         self.collision = False
         self.action_list = []
-        self.world.tick()
+        
+        # Tick with retry mechanism
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                self.world.tick()
+                break
+            except RuntimeError as e:
+                if retry < max_retries - 1:
+                    print(f"[WARNING] World tick failed (attempt {retry+1}/{max_retries}), retrying...")
+                    time.sleep(2.0)
+                else:
+                    raise e
 
         time.sleep(0.2)
         obs = self.step(None)[0]

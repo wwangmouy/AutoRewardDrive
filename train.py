@@ -13,24 +13,15 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from config import set_config
-from carla_env.envs.carla_route_env import CarlaRouteEnv
-from carla_env.state_commons import create_encode_state_fn
-from carla_env.rewards import reward_functions
 from utils import write_json
 
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), 'reward_upper'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'agent'))
-from reward_machine import RewardLearner, Transition
-from sac_agent import AutoRewardDrive_SAC
-from shared_encoder import SharedStateEncoder
-
+# Initialize CONFIG first before importing modules that depend on it
 parser = argparse.ArgumentParser()
 parser.add_argument("--host", default="localhost", type=str)
 parser.add_argument("--port", default=2000, type=int)
 parser.add_argument("--total_timesteps", type=int, default=1_000_000)
 parser.add_argument("--start_carla", action="store_true")
-parser.add_argument("--no_render", action="store_false")
+parser.add_argument("--render", action="store_true", help="Enable rendering")
 parser.add_argument("--fps", type=int, default=15)
 parser.add_argument("--log_dir", type=str, default="tensorboard")
 parser.add_argument("--device", type=str, default="cuda:0")
@@ -39,6 +30,18 @@ parser.add_argument("--save_freq", type=int, default=10000)
 args = vars(parser.parse_args())
 
 CONFIG = set_config("default")
+
+# Import after CONFIG is initialized
+from carla_env.envs.carla_route_env import CarlaRouteEnv
+from carla_env.state_commons import create_encode_state_fn
+from carla_env.rewards import reward_functions
+
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), 'reward_upper'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'agent'))
+from reward_machine import RewardLearner, Transition
+from sac_agent import AutoRewardDrive_SAC
+from shared_encoder import SharedStateEncoder
 
 
 def extract_state(obs):
@@ -52,7 +55,7 @@ def extract_state(obs):
         vector_parts.append(np.array(obs['waypoints']).flatten())
     
     if not vector_parts:
-        raise ValueError(f"obs missing required keys: need 'vehicle_measures' or 'waypoints', got keys: {list(obs.keys())}")
+        raise ValueError(f"obs missing required keys: need 'vehicle_measures' or 'waypoints'")
     
     vector = torch.tensor(np.concatenate(vector_parts), dtype=torch.float32)
     assert vector.shape[0] == 34, f"Vector dimension mismatch: expected 34, got {vector.shape[0]}"
@@ -64,13 +67,20 @@ def train():
     device = args["device"]
     
     observation_space, encode_state_fn = create_encode_state_fn(CONFIG.state, CONFIG)
+    
+    # Check action_smoothing consistency
+    if CONFIG.action_smoothing != 0.0:
+        print(f"\nWARNING: action_smoothing = {CONFIG.action_smoothing} != 0.0")
+        print(f"This will cause incorrect importance sampling in reward learning!")
+        print(f"Recommendation: Set CONFIG.action_smoothing = 0.0\n")
+    
     env = CarlaRouteEnv(
         obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
         reward_fn=reward_functions[CONFIG.reward_fn],
         observation_space=observation_space, encode_state_fn=encode_state_fn,
         fps=args["fps"], action_smoothing=CONFIG.action_smoothing,
         action_space_type='continuous',
-        activate_spectator=args["no_render"], activate_render=args["no_render"],
+        activate_spectator=args["render"], activate_render=args["render"],
         activate_seg_bev=CONFIG.use_seg_bev, start_carla=args["start_carla"],
     )
     
@@ -99,16 +109,15 @@ def train():
     for step in pbar:
         action, log_prob = agent.select_action(bev.unsqueeze(0), vector.unsqueeze(0))
         
-        # Standardize actions for storage
         action = action.squeeze(0)
-        log_prob = log_prob.squeeze(0)
-        
-        action_np = action.cpu().numpy()
+        log_prob_scalar = float(log_prob.view(-1)[0].item())
+        # Detach before converting to numpy (robust to future agent changes)
+        action_np = action.detach().cpu().numpy()
         
         next_obs, sparse_reward, done, info = env.step(action_np)
         next_bev, next_vector = extract_state(next_obs)
         
-        # Reward Warmup & Mixing
+        # Reward mixing (warmup period + gradual transition)
         reward_warmup_steps = CONFIG.reward_learning_params.reward_warmup_steps
         reward_mixing_steps = max(1, CONFIG.reward_learning_params.reward_mixing_steps)
         
@@ -122,24 +131,22 @@ def train():
             learned_reward_tensor = reward_learner.get_reward(
                 bev.unsqueeze(0).to(device),
                 vector.unsqueeze(0).to(device),
-                action.unsqueeze(0).to(device)
+                action.unsqueeze(0).to(device),
+                update_stats=False
             )
             learned_reward = float(learned_reward_tensor)
         
-        # Mix rewards: (1 - alpha) * sparse + alpha * learned
         training_reward = (1.0 - alpha) * sparse_reward + alpha * learned_reward
         
-        # Push to Replay Buffer
         agent.replay_buffer.push(bev, vector, action, training_reward, 
                                   next_bev, next_vector, done)
         
-        # Store for reward learning
         current_trajectory.append(Transition(
             bev_image=bev.cpu(),
             vector_state=vector.cpu(),
             action=action.cpu(),
             sparse_reward=sparse_reward,
-            log_prob=float(log_prob.item()),
+            log_prob=log_prob_scalar,
             overline_V=0.0,
             next_bev=next_bev.cpu(),
             next_vector=next_vector.cpu(),
@@ -159,7 +166,6 @@ def train():
         if done:
             episode_count += 1
             
-            # Store trajectory only if it meets minimum length requirement
             min_steps = CONFIG.reward_learning_params.min_steps_per_traj
             if len(current_trajectory) >= min_steps:
                 reward_learner.store_trajectory(current_trajectory)
@@ -199,7 +205,6 @@ def train():
             episode_sparse_reward = 0
             episode_learned_return = 0
         
-        # Save checkpoint every save_freq steps (independent of episode boundaries)
         if step % args["save_freq"] == 0 and step > 0:
             agent.save(os.path.join(log_dir, f'agent_{step}.pth'))
             reward_learner.save(os.path.join(log_dir, f'reward_{step}.pth'))

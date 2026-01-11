@@ -22,9 +22,11 @@ class RunningMeanStd:
         self.count = epsilon
     
     def update(self, x):
-        batch_mean = np.mean(x)
-        batch_var = np.var(x)
-        batch_count = len(x) if hasattr(x, '__len__') else 1
+        """Update running statistics (always flattens input to 1D)"""
+        x_flat = np.asarray(x).ravel()
+        batch_mean = x_flat.mean()
+        batch_var = x_flat.var()
+        batch_count = x_flat.size
         self._update_from_moments(batch_mean, batch_var, batch_count)
     
     def _update_from_moments(self, batch_mean, batch_var, batch_count):
@@ -42,7 +44,7 @@ class RunningMeanStd:
 
 
 class RewardLearner:
-    """Reward learning with EMA target encoder for stability"""
+    """Reward learning with EMA target encoder"""
     
     def __init__(self, config, shared_encoder=None, device="cuda:0"):
         self.config = config
@@ -81,7 +83,6 @@ class RewardLearner:
         self.reward_optimizer = optim.Adam(self.reward_function.parameters(), lr=self.lr)
         self.value_optimizer = optim.Adam(self.value_function.parameters(), lr=self.lr)
         
-        # New: V_omega for computing Advantage of learned reward
         self.learned_value_function = ValueFunction(
             state_feature_dim=state_feature_dim,
             hidden_dim=self.hidden_dim
@@ -89,8 +90,6 @@ class RewardLearner:
         self.learned_value_optimizer = optim.Adam(self.learned_value_function.parameters(), lr=self.lr)
         
         self.trajectory_buffer = deque(maxlen=params.reward_buffer_size)
-        
-        # Reward normalization for SAC stability
         self.reward_normalizer = RunningMeanStd()
     
     def _init_target_encoder(self, encoder):
@@ -99,29 +98,35 @@ class RewardLearner:
         self.target_encoder.to(self.device)
         for param in self.target_encoder.parameters():
             param.requires_grad = False
-        self.target_encoder.eval()  # Always eval mode for stability
+        self.target_encoder.eval()
     
     def update_target_encoder(self):
+        """EMA update of target encoder"""
         if self.target_encoder is None or self.shared_encoder is None:
             return
         for target_param, param in zip(self.target_encoder.parameters(), 
                                         self.shared_encoder.parameters()):
             target_param.data.copy_(self.encoder_tau * param.data + 
                                     (1 - self.encoder_tau) * target_param.data)
+        self.target_encoder.eval()
 
     def set_shared_encoder(self, encoder):
         self.shared_encoder = encoder
         self._init_target_encoder(encoder)
 
     def get_state_features(self, bev, vector):
+        """Extract state features using target encoder (frozen)"""
         if self.target_encoder is None:
             if self.shared_encoder is None:
                 raise ValueError("Encoder not set")
-            return self.shared_encoder(bev, vector)
-        self.target_encoder.eval()  # Ensure eval mode
-        return self.target_encoder(bev, vector)
+            self._init_target_encoder(self.shared_encoder)
+        
+        self.target_encoder.eval()
+        with torch.no_grad():
+            return self.target_encoder(bev, vector)
 
-    def get_reward(self, bev, vector, action, update_stats=True):
+    def get_reward(self, bev, vector, action, update_stats=False):
+        """Compute learned reward (normalized and clipped)"""
         if bev.dim() == 3:
             bev = bev.unsqueeze(0)
         if vector.dim() == 1:
@@ -133,7 +138,6 @@ class RewardLearner:
             state_features = self.get_state_features(bev, vector)
             raw_reward = self.reward_function(state_features, action).cpu().numpy().squeeze()
         
-        # Update stats if requested
         if update_stats:
             if raw_reward.ndim == 0:
                 self.reward_normalizer.update([float(raw_reward)])
@@ -155,10 +159,14 @@ class RewardLearner:
         self.trajectory_buffer.append(processed)
 
     def _compute_returns(self, trajectory):
+        """Compute Monte Carlo returns (terminal state: no bootstrap)"""
         processed = []
         overline_V = 0.0
         for transition in reversed(trajectory):
-            overline_V = transition.sparse_reward + self.gamma * overline_V
+            if transition.done:
+                overline_V = transition.sparse_reward
+            else:
+                overline_V = transition.sparse_reward + self.gamma * overline_V
             processed.insert(0, transition._replace(overline_V=overline_V))
         return processed
 
@@ -167,7 +175,6 @@ class RewardLearner:
         if len(self.trajectory_buffer) < self.min_trajectories:
             return None
         
-        # Filter trajectories that assume minimum steps
         valid_indices = [i for i, t in enumerate(self.trajectory_buffer) 
                          if len(t) >= self.min_steps_per_traj]
         
@@ -183,14 +190,11 @@ class RewardLearner:
         bev_batch, vector_batch, action_batch, overline_V_batch = [], [], [], []
         next_bev_batch, next_vector_batch, done_batch, old_log_prob_batch = [], [], [], []
         
-        # Optimization: cast deque to list once
         buffer_list = list(self.trajectory_buffer)
         
         for idx in traj_indices:
             trajectory = buffer_list[idx]
-            # Sample M steps (or fewer if traj is short, but we filtered for min len)
             sample_size = min(len(trajectory), steps_per_traj)
-            # Random uniform sampling from trajectory
             for i in np.random.choice(len(trajectory), sample_size, replace=False):
                 t = trajectory[i]
                 bev_batch.append(t.bev_image)
@@ -213,42 +217,43 @@ class RewardLearner:
         next_bev_batch = torch.stack(next_bev_batch).to(self.device)
         next_vector_batch = torch.stack(next_vector_batch).to(self.device)
         done_batch = torch.tensor(done_batch, dtype=torch.float32, device=self.device).view(-1)
-        # log_prob is stored as float, so use tensor() instead of stack()
-        old_log_prob_batch = torch.tensor(old_log_prob_batch, dtype=torch.float32, device=self.device)
+        old_log_prob_batch = torch.tensor(old_log_prob_batch, dtype=torch.float32, device=self.device).view(-1)
         
+        # Extract features using frozen target encoder (no gradient to encoder)
         with torch.no_grad():
             state_features = self.get_state_features(bev_batch, vector_batch)
             next_state_features = self.get_state_features(next_bev_batch, next_vector_batch)
-            
-            # Re-compute current log_prob for Importance Sampling
-            # We use agent.evaluate_log_prob(bev, vector, action) from actor
             new_log_prob = agent.evaluate_log_prob(bev_batch, vector_batch, action_batch).view(-1)
         
-        # Importance Sampling Weights (log-space clamp for numerical stability)
+        assert old_log_prob_batch.shape == new_log_prob.shape, \
+            f"Shape mismatch: old_log_prob {old_log_prob_batch.shape} vs new_log_prob {new_log_prob.shape}"
+        
+        # Importance sampling: rho = pi_current / pi_behavior = exp(new - old)
+        # VERIFIED: old_log_prob from rollout (behavior), new_log_prob from current policy (target)
+        # This matches off-policy correction for estimating current policy's expectation
         is_clip_min = self.config.reward_learning_params.get("is_clip_min", 0.1)
         is_clip_max = self.config.reward_learning_params.get("is_clip_max", 10.0)
         log_is_weights = (new_log_prob - old_log_prob_batch).clamp(np.log(is_clip_min), np.log(is_clip_max))
         is_weights = torch.exp(log_is_weights)
 
-        V_s = self.value_function(state_features).squeeze()
+        V_s = self.value_function(state_features).view(-1)
         advantage = overline_V_batch - V_s.detach()
-        
-        # Center advantage (remove mean shift)
         advantage = advantage - advantage.mean()
-        
-        # Robust normalization
         std = advantage.std().clamp(min=1e-3)
         normalized_advantage = advantage / (std + 1e-8)
         
-        # Learned Reward and Advantage_omega
-        learned_rewards = self.reward_function(state_features, action_batch).squeeze()
-        V_omega_s = self.learned_value_function(state_features).squeeze()
-        V_omega_next = self.learned_value_function(next_state_features).detach().squeeze()
+        learned_rewards = self.reward_function(state_features, action_batch).view(-1)
         
+        # Update normalizer stats from batch (stats only updated here, not in rollout)
+        # NOTE: Early training may have unstable reward scale until stats converge
+        assert learned_rewards.ndim == 1, f"Expected 1D tensor, got shape {learned_rewards.shape}"
+        self.reward_normalizer.update(learned_rewards.detach().cpu().numpy())
+        
+        V_omega_s = self.learned_value_function(state_features).view(-1)
+        V_omega_next = self.learned_value_function(next_state_features).detach().view(-1)
         advantage_omega = learned_rewards + self.gamma * V_omega_next * (1 - done_batch) - V_omega_s.detach()
         
-        # Loss = - E [ w_IS * bar_A * A_omega ]
-        # We removed variance_loss as it conflicts with the pure objective
+        # Reward learning loss
         loss = -torch.mean(is_weights * normalized_advantage * advantage_omega)
         
         self.reward_optimizer.zero_grad()
@@ -258,8 +263,7 @@ class RewardLearner:
         
         self._update_value_function(state_features.detach(), overline_V_batch)
         
-        # Update V_omega
-        # Target = r_omega + gamma * V_omega(s')
+        # Update learned value function
         v_omega_target = (learned_rewards.detach() + self.gamma * V_omega_next * (1 - done_batch)).detach()
         v_omega_loss = nn.functional.mse_loss(V_omega_s, v_omega_target)
         
@@ -270,7 +274,7 @@ class RewardLearner:
         return loss.item()
     
     def _update_value_function(self, state_features, target_V):
-        pred_V = self.value_function(state_features).squeeze()
+        pred_V = self.value_function(state_features).view(-1)
         loss = nn.functional.smooth_l1_loss(pred_V, target_V)
         
         self.value_optimizer.zero_grad()

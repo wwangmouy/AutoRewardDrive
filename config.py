@@ -28,7 +28,9 @@ reward_params = {
         max_center_deviation=3.0,
         max_speed=35.0,
         max_steps=1000,
-        # max_distance removed to avoid confusion with center deviation
+        max_distance=3.0,
+        max_std_center_lane=2.0,
+        max_angle_center_lane=30.0,
     ),
 }
 
