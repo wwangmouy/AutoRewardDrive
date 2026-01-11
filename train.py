@@ -27,6 +27,7 @@ parser.add_argument("--log_dir", type=str, default="tensorboard")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--upper_update_freq", type=int, default=10)
 parser.add_argument("--save_freq", type=int, default=10000)
+parser.add_argument("--traffic", action="store_true", help="Enable background traffic vehicles")
 args = vars(parser.parse_args())
 
 CONFIG = set_config("default")
@@ -82,6 +83,7 @@ def train():
         action_space_type='continuous',
         activate_spectator=args["render"], activate_render=args["render"],
         activate_seg_bev=CONFIG.use_seg_bev, start_carla=args["start_carla"],
+        activate_traffic_flow=args["traffic"],
     )
     
     shared_encoder = SharedStateEncoder(
