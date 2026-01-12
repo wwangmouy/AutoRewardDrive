@@ -170,12 +170,18 @@ class AutoRewardedSAC(SAC):
             std = log_std.exp()
             normal = torch.distributions.Normal(mean, std)
             
+            # Get action bounds from action_space
+            action_low = torch.tensor(self.action_space.low, device=self.device).float()
+            action_high = torch.tensor(self.action_space.high, device=self.device).float()
+            action_scale = (action_high - action_low) / 2.0
+            action_bias = (action_high + action_low) / 2.0
+            
             x_t = normal.rsample((n_samples,))
             y_t = torch.tanh(x_t)
-            action = y_t * self.actor.action_scale + self.actor.action_bias
+            action = y_t * action_scale + action_bias
             
             log_prob = normal.log_prob(x_t)
-            log_prob -= torch.log(self.actor.action_scale * (1 - y_t.pow(2)) + 1e-6)
+            log_prob -= torch.log(action_scale * (1 - y_t.pow(2)) + 1e-6)
             log_prob = log_prob.sum(dim=-1, keepdim=True)
             
             return action, log_prob

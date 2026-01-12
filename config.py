@@ -137,9 +137,9 @@ algorithm_params = {
         ent_coef='auto',
         gamma=0.98,
         tau=0.02,
-        train_freq=64,
+        train_freq=128,
         gradient_steps=64,
-        learning_starts=10000,
+        learning_starts=1000,
         use_sde=True,
         policy_kwargs=dict(
             log_std_init=-3, net_arch=[400, 300],
