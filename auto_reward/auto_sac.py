@@ -55,6 +55,11 @@ class AutoRewardedSAC(SAC):
         device: Union[torch.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
+        # Must set these BEFORE super().__init__() because it calls _setup_model()
+        self.config = config
+        self.reward_update_freq = config.get('reward_update_freq', 2048)
+        self.auto_reward_learner = None  # Initialized in _setup_model
+        
         super().__init__(
             policy,
             env,
@@ -84,21 +89,21 @@ class AutoRewardedSAC(SAC):
             device,
             _init_setup_model,
         )
-        self.config = config
-        self.reward_update_freq = config.get('reward_update_freq', 2048)
-        self.auto_reward_learner = None # Initialized in _setup_model
 
     def _setup_model(self) -> None:
         super()._setup_model()
         
         # Initialize AutoRewardLearner
         # Calculate state_dim from the features extractor
-        # Assuming the policy uses a features extractor that outputs a flat vector (e.g., CustomMultiInputExtractor)
-        if hasattr(self.policy, "features_extractor") and hasattr(self.policy.features_extractor, "features_dim"):
+        # At this point, self.policy is fully initialized by super()._setup_model()
+        if hasattr(self.policy, "features_extractor") and hasattr(self.policy.features_extractor, "_features_dim"):
+            state_dim = self.policy.features_extractor._features_dim
+        elif hasattr(self.policy, "features_extractor") and hasattr(self.policy.features_extractor, "features_dim"):
             state_dim = self.policy.features_extractor.features_dim
         else:
-            # Fallback for simple MLPs
-            state_dim = self.observation_space.shape[0]
+            # Fallback: compute flattened observation dimension
+            from stable_baselines3.common.preprocessing import get_flattened_obs_dim
+            state_dim = get_flattened_obs_dim(self.observation_space)
 
         action_dim = self.action_space.shape[0]
         
