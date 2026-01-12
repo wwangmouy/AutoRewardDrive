@@ -119,7 +119,7 @@ class CarlaRouteEnv(gym.Env):
 
         self.carla_process = None
         if start_carla:
-            CARLA_ROOT = "/home/wy/CARLA_0.9.13"
+            CARLA_ROOT = "/home/sky-lab/CARLA_0.9.13"
             carla_path = os.path.join(CARLA_ROOT, "CarlaUE4.sh")
             launch_command = [carla_path]
             launch_command += ['-quality_level=Low']
@@ -197,7 +197,7 @@ class CarlaRouteEnv(gym.Env):
         self.world = None
         try:
             self.client = carla.Client(host, port)
-            self.client.set_timeout(30.0)  # Increased timeout for initialization
+            self.client.set_timeout(5.0)
             self.world = World(self.client, town=town)
 
             settings = self.world.get_settings()
@@ -292,19 +292,7 @@ class CarlaRouteEnv(gym.Env):
         self.low_speed_timer = 0.0
         self.collision = False
         self.action_list = []
-        
-        # Tick with retry mechanism
-        max_retries = 3
-        for retry in range(max_retries):
-            try:
-                self.world.tick()
-                break
-            except RuntimeError as e:
-                if retry < max_retries - 1:
-                    print(f"[WARNING] World tick failed (attempt {retry+1}/{max_retries}), retrying...")
-                    time.sleep(2.0)
-                else:
-                    raise e
+        self.world.tick()
 
         time.sleep(0.2)
         obs = self.step(None)[0]
@@ -342,7 +330,6 @@ class CarlaRouteEnv(gym.Env):
         self.distance_from_center_history = deque(maxlen=30)
 
         self.current_waypoint_index = 0
-        self.prev_waypoint_index = 0 
         self.num_routes_completed += 1
         self.vehicle.set_transform(self.start_wp.transform)
         time.sleep(0.2)

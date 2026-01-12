@@ -423,17 +423,8 @@ class World():
     def tick(self):
         for actor in list(self.actor_list):
             actor.tick()
-        
-        try:
-            self.world.tick()
-        except RuntimeError as e:
-            if "time-out" in str(e):
-                print(f"[WARNING] World tick timeout, retrying...")
-                import time
-                time.sleep(1.0)
-                self.world.tick()
-            else:
-                raise e
+
+        self.world.tick()
 
     def destroy(self):
         print("Destroying all spawned actors")

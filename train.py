@@ -1,222 +1,94 @@
-"""AutoRewardDrive: Training Script"""
-
 import warnings
 import os
+from datetime import datetime
+
 warnings.filterwarnings("ignore")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 import argparse
-import torch
-import numpy as np
-from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+import config
 
-from config import set_config
-from utils import write_json
+parser = argparse.ArgumentParser(description="Trains a CARLA agent")
+parser.add_argument("--host", default="localhost", type=str, help="IP of the host server (default: 127.0.0.1)")
+parser.add_argument("--port", default=2000, type=int, help="TCP port to listen to (default: 2000)")
+parser.add_argument("--total_timesteps", type=int, default=1_000_000, help="Total timestep to train for")
+parser.add_argument("--start_carla", action="store_true", help="If True, start a CARLA server")
+parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
+parser.add_argument("--fps", type=int, default=15, help="FPS to render the environment")
+parser.add_argument("--num_checkpoints", type=int, default=100, help="Checkpoint number")
+parser.add_argument("--log_dir", type=str, default="tensorboard", help="Directory to save logs")
+parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
+parser.add_argument("--config", type=str, default="vlm_rl_ppo", help="Config to use (default: vlm_rl)")
 
-# Initialize CONFIG first before importing modules that depend on it
-parser = argparse.ArgumentParser()
-parser.add_argument("--host", default="localhost", type=str)
-parser.add_argument("--port", default=2000, type=int)
-parser.add_argument("--total_timesteps", type=int, default=1_000_000)
-parser.add_argument("--start_carla", action="store_true")
-parser.add_argument("--render", action="store_true", help="Enable rendering")
-parser.add_argument("--fps", type=int, default=15)
-parser.add_argument("--log_dir", type=str, default="tensorboard")
-parser.add_argument("--device", type=str, default="cuda:0")
-parser.add_argument("--upper_update_freq", type=int, default=10)
-parser.add_argument("--save_freq", type=int, default=10000)
-parser.add_argument("--traffic", action="store_true", help="Enable background traffic vehicles")
 args = vars(parser.parse_args())
+CONFIG = config.set_config(args["config"])
+CONFIG.algorithm_params.device = args["device"]
 
-CONFIG = set_config("default")
-
-# Import after CONFIG is initialized
+from stable_baselines3 import PPO, DDPG, SAC
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.logger import configure
 from carla_env.envs.carla_route_env import CarlaRouteEnv
 from carla_env.state_commons import create_encode_state_fn
 from carla_env.rewards import reward_functions
+from utils import HParamCallback, TensorboardCallback, write_json, parse_wrapper_class
+from auto_reward.auto_sac import AutoRewardedSAC
 
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), 'reward_upper'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'agent'))
-from reward_machine import RewardLearner, Transition
-from sac_agent import AutoRewardDrive_SAC
-from shared_encoder import SharedStateEncoder
+os.makedirs(args["log_dir"], exist_ok=True)
 
+algorithm_dict = {
+    "PPO": PPO, "DDPG": DDPG, "SAC": SAC,
+    "SAC_AUTO": AutoRewardedSAC
+}
+if CONFIG.algorithm not in algorithm_dict:
+    raise ValueError("Invalid algorithm name")
 
-def extract_state(obs):
-    """Extract BEV and vector state from observation dict"""
-    bev = torch.tensor(obs['seg_camera'], dtype=torch.float32).permute(2, 0, 1) / 255.0
-    
-    vector_parts = []
-    if 'vehicle_measures' in obs:
-        vector_parts.append(np.array(obs['vehicle_measures']).flatten())
-    if 'waypoints' in obs:
-        vector_parts.append(np.array(obs['waypoints']).flatten())
-    
-    if not vector_parts:
-        raise ValueError(f"obs missing required keys: need 'vehicle_measures' or 'waypoints'")
-    
-    vector = torch.tensor(np.concatenate(vector_parts), dtype=torch.float32)
-    assert vector.shape[0] == 34, f"Vector dimension mismatch: expected 34, got {vector.shape[0]}"
-    return bev, vector
+AlgorithmRL = algorithm_dict[CONFIG.algorithm]
 
+observation_space, encode_state_fn = create_encode_state_fn(CONFIG.state, CONFIG)
+action_space_type = 'continuous' if CONFIG.action_space_type != 'discrete' else 'discrete'
 
-def train():
-    os.makedirs(args["log_dir"], exist_ok=True)
-    device = args["device"]
-    
-    observation_space, encode_state_fn = create_encode_state_fn(CONFIG.state, CONFIG)
-    
-    # Check action_smoothing consistency
-    if CONFIG.action_smoothing != 0.0:
-        print(f"\nWARNING: action_smoothing = {CONFIG.action_smoothing} != 0.0")
-        print(f"This will cause incorrect importance sampling in reward learning!")
-        print(f"Recommendation: Set CONFIG.action_smoothing = 0.0\n")
-    
-    env = CarlaRouteEnv(
-        obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
-        reward_fn=reward_functions[CONFIG.reward_fn],
-        observation_space=observation_space, encode_state_fn=encode_state_fn,
-        fps=args["fps"], action_smoothing=CONFIG.action_smoothing,
-        action_space_type='continuous',
-        activate_spectator=args["render"], activate_render=args["render"],
-        activate_seg_bev=CONFIG.use_seg_bev, start_carla=args["start_carla"],
-        activate_traffic_flow=args["traffic"],
+env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
+                    reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
+                    encode_state_fn=encode_state_fn, fps=args["fps"],
+                    action_smoothing=CONFIG.action_smoothing, action_space_type=action_space_type,
+                    activate_spectator=args["no_render"], activate_render=args["no_render"],
+                    activate_bev=CONFIG.use_rgb_bev, activate_seg_bev=CONFIG.use_seg_bev,
+                    activate_traffic_flow=True, start_carla=args["start_carla"],
+                    )
+
+for wrapper_class_str in CONFIG.wrappers:
+    wrap_class, wrap_params = parse_wrapper_class(wrapper_class_str)
+    env = wrap_class(env, *wrap_params)
+
+if AlgorithmRL.__name__ == "AutoRewardedSAC":
+    model = AlgorithmRL(
+        policy='MultiInputPolicy',
+        env=env,
+        config=CONFIG,  # Critical: config must be passed
+        verbose=1,
+        seed=CONFIG.seed,
+        tensorboard_log=args["log_dir"],
+        **CONFIG.algorithm_params
     )
-    
-    shared_encoder = SharedStateEncoder(
-        bev_channels=6, vector_dim=34, bev_features=128, vector_features=64
-    ).to(device)
-    
-    agent = AutoRewardDrive_SAC(CONFIG, shared_encoder=shared_encoder, device=device)
-    reward_learner = RewardLearner(CONFIG, shared_encoder=shared_encoder, device=device)
-    
-    log_dir = os.path.join(args["log_dir"], f'AutoRewardDrive_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-    os.makedirs(log_dir, exist_ok=True)
-    write_json(CONFIG, os.path.join(log_dir, 'config.json'))
-    writer = SummaryWriter(log_dir)
-    
-    obs = env.reset()
-    bev, vector = extract_state(obs)
-    
-    episode_reward = 0
-    episode_sparse_reward = 0
-    episode_learned_return = 0
-    episode_count = 0
-    current_trajectory = []
-    pbar = tqdm(range(args["total_timesteps"]), desc="Training", unit="step")
-    
-    for step in pbar:
-        action, log_prob = agent.select_action(bev.unsqueeze(0), vector.unsqueeze(0))
-        
-        action = action.squeeze(0)
-        log_prob_scalar = float(log_prob.view(-1)[0].item())
-        # Detach before converting to numpy (robust to future agent changes)
-        action_np = action.detach().cpu().numpy()
-        
-        next_obs, sparse_reward, done, info = env.step(action_np)
-        next_bev, next_vector = extract_state(next_obs)
-        
-        # Reward mixing (warmup period + gradual transition)
-        reward_warmup_steps = CONFIG.reward_learning_params.reward_warmup_steps
-        reward_mixing_steps = max(1, CONFIG.reward_learning_params.reward_mixing_steps)
-        
-        if step < reward_warmup_steps:
-            alpha = 0.0
-        else:
-            alpha = min(1.0, (step - reward_warmup_steps) / reward_mixing_steps)
-        
-        learned_reward = 0.0
-        if alpha > 0:
-            learned_reward_tensor = reward_learner.get_reward(
-                bev.unsqueeze(0).to(device),
-                vector.unsqueeze(0).to(device),
-                action.unsqueeze(0).to(device),
-                update_stats=False
-            )
-            learned_reward = float(learned_reward_tensor)
-        
-        training_reward = (1.0 - alpha) * sparse_reward + alpha * learned_reward
-        
-        agent.replay_buffer.push(bev, vector, action, training_reward, 
-                                  next_bev, next_vector, done)
-        
-        current_trajectory.append(Transition(
-            bev_image=bev.cpu(),
-            vector_state=vector.cpu(),
-            action=action.cpu(),
-            sparse_reward=sparse_reward,
-            log_prob=log_prob_scalar,
-            overline_V=0.0,
-            next_bev=next_bev.cpu(),
-            next_vector=next_vector.cpu(),
-            done=done
-        ))
-        
-        update_info = None
-        if step > CONFIG.algorithm_params.learning_starts:
-            update_info = agent.update()
-            reward_learner.update_target_encoder()
-        
-        episode_reward += training_reward
-        episode_sparse_reward += sparse_reward
-        episode_learned_return += learned_reward
-        bev, vector = next_bev, next_vector
-        
-        if done:
-            episode_count += 1
-            
-            min_steps = CONFIG.reward_learning_params.min_steps_per_traj
-            if len(current_trajectory) >= min_steps:
-                reward_learner.store_trajectory(current_trajectory)
-            current_trajectory = []
-            
-            reward_loss = None
-            min_trajectories = CONFIG.reward_learning_params.min_trajectories
-            if step >= reward_warmup_steps and len(reward_learner.trajectory_buffer) >= min_trajectories:
-                if episode_count % args["upper_update_freq"] == 0:
-                    reward_loss = reward_learner.optimize_upper_level(agent)
-            
-            writer.add_scalar("episode/mixed_return", episode_reward, episode_count)
-            writer.add_scalar("episode/sparse_return", episode_sparse_reward, episode_count)
-            writer.add_scalar("episode/learned_return", episode_learned_return, episode_count)
-            writer.add_scalar("episode/length", info.get("episode_length", 0), episode_count)
-            writer.add_scalar("episode/distance", info.get("total_distance", 0), episode_count)
-            writer.add_scalar("episode/avg_speed", info.get("avg_speed", 0), episode_count)
-            writer.add_scalar("episode/collision", 1 if info.get("collision_state", False) else 0, episode_count)
-            
-            if update_info:
-                writer.add_scalar("losses/critic", update_info.get("critic_loss", 0), episode_count)
-                writer.add_scalar("losses/actor", update_info.get("actor_loss", 0), episode_count)
-                writer.add_scalar("losses/alpha", update_info.get("alpha", 0), episode_count)
-            
-            if reward_loss is not None:
-                writer.add_scalar("losses/reward", reward_loss, episode_count)
-            
-            pbar.set_postfix({
-                'ep': episode_count,
-                'reward': f'{episode_reward:.1f}',
-                'dist': f'{info.get("total_distance", 0):.0f}m'
-            })
-            
-            obs = env.reset()
-            bev, vector = extract_state(obs)
-            episode_reward = 0
-            episode_sparse_reward = 0
-            episode_learned_return = 0
-        
-        if step % args["save_freq"] == 0 and step > 0:
-            agent.save(os.path.join(log_dir, f'agent_{step}.pth'))
-            reward_learner.save(os.path.join(log_dir, f'reward_{step}.pth'))
+else:
+    model = AlgorithmRL(
+        'MultiInputPolicy',
+        env,
+        verbose=1,
+        seed=CONFIG.seed,
+        tensorboard_log=args["log_dir"],
+        **CONFIG.algorithm_params
+    )
 
-    
-    agent.save(os.path.join(log_dir, 'agent_final.pth'))
-    reward_learner.save(os.path.join(log_dir, 'reward_final.pth'))
-    writer.close()
-    env.close()
+model_suffix = "{}_id{}".format(datetime.now().strftime("%Y%m%d_%H%M%S"), args['config'])
+model_name = f'{model.__class__.__name__}_{model_suffix}'
+model_dir = os.path.join(args["log_dir"], model_name)
 
+new_logger = configure(model_dir, ["stdout", "csv", "tensorboard"])
+model.set_logger(new_logger)
+write_json(CONFIG, os.path.join(model_dir, 'config.json'))
 
-if __name__ == "__main__":
-    train()
+model.learn(total_timesteps=args["total_timesteps"],
+            callback=[HParamCallback(CONFIG), TensorboardCallback(1), CheckpointCallback(
+                save_freq=args["total_timesteps"] // args["num_checkpoints"],
+                save_path=model_dir, name_prefix="model")], reset_num_timesteps=False)
