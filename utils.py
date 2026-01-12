@@ -99,8 +99,22 @@ class TensorboardCallback(BaseCallback):
 
     def __init__(self, verbose=0):
         super().__init__(verbose)
+        self.episode_learned_rewards = []
+        self.episode_ground_truth_rewards = []
 
     def _on_step(self) -> bool:
+        # Track rewards per step for AutoReward comparison
+        if hasattr(self.model, 'auto_reward_learner'):
+            # Get the last stored ground truth reward from infos if available
+            if 'ground_truth_reward' in self.locals.get('infos', [{}])[0]:
+                self.episode_ground_truth_rewards.append(
+                    self.locals['infos'][0]['ground_truth_reward']
+                )
+            # Get learned reward from replay buffer (most recent)
+            if hasattr(self.model, 'replay_buffer') and self.model.replay_buffer.pos > 0:
+                last_learned_reward = self.model.replay_buffer.rewards[self.model.replay_buffer.pos - 1]
+                self.episode_learned_rewards.append(float(last_learned_reward))
+
         # Log scalar value (here a random variable)
         if self.locals['dones'][0]:
             self.logger.record("time/num_timesteps", self.num_timesteps)
@@ -110,8 +124,6 @@ class TensorboardCallback(BaseCallback):
             self.logger.record("custom/avg_center_dev", self.locals['infos'][0]['avg_center_dev'])
             self.logger.record("custom/avg_speed", self.locals['infos'][0]['avg_speed'])
             self.logger.record("custom/mean_reward", self.locals['infos'][0]['mean_reward'])
-            self.logger.record("custom/mean_reward", self.locals['infos'][0]['mean_reward'])
-            self.logger.record("time/num_timesteps", self.num_timesteps)
             self.logger.record("custom/collision_rate", self.locals['infos'][0]['collision_rate'])
             self.logger.record("custom/collision_num", self.locals['infos'][0]['collision_num'])
             self.logger.record("custom/episode_length", self.locals['infos'][0]['episode_length'])
@@ -120,6 +132,31 @@ class TensorboardCallback(BaseCallback):
                 self.logger.record("custom/CPM", self.locals['infos'][0]['CPM'])
                 self.logger.record("custom/collision_interval", self.locals['infos'][0]['collision_interval'])
                 self.logger.record("custom/collision_speed", self.locals['infos'][0]['collision_speed'])
+
+            # AutoReward specific metrics
+            if hasattr(self.model, 'auto_reward_learner'):
+                learner = self.model.auto_reward_learner
+                # Trajectory buffer size
+                self.logger.record("autoreward/trajectory_buffer_size", len(learner.D_xi))
+                
+                # Episode-level reward comparison
+                if self.episode_learned_rewards:
+                    self.logger.record("autoreward/ep_mean_learned_reward", np.mean(self.episode_learned_rewards))
+                    self.logger.record("autoreward/ep_sum_learned_reward", np.sum(self.episode_learned_rewards))
+                if self.episode_ground_truth_rewards:
+                    self.logger.record("autoreward/ep_mean_gt_reward", np.mean(self.episode_ground_truth_rewards))
+                    self.logger.record("autoreward/ep_sum_gt_reward", np.sum(self.episode_ground_truth_rewards))
+                
+                # Reward correlation (if both available)
+                if len(self.episode_learned_rewards) > 1 and len(self.episode_ground_truth_rewards) > 1:
+                    if len(self.episode_learned_rewards) == len(self.episode_ground_truth_rewards):
+                        correlation = np.corrcoef(self.episode_learned_rewards, self.episode_ground_truth_rewards)[0, 1]
+                        if not np.isnan(correlation):
+                            self.logger.record("autoreward/reward_correlation", correlation)
+                
+                # Reset episode tracking
+                self.episode_learned_rewards = []
+                self.episode_ground_truth_rewards = []
 
             self.logger.dump(self.num_timesteps)
 

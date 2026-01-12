@@ -2,8 +2,8 @@ import os
 import argparse
 import pandas as pd
 import numpy as np
+import torch
 import config
-from clip.clip_rewarded_ppo import CLIPRewardedPPO
 
 parser = argparse.ArgumentParser(description="Eval a CARLA agent")
 parser.add_argument("--host", default="localhost", type=str, help="IP of the host server (default: 127.0.0.1)")
@@ -26,7 +26,7 @@ CONFIG.seed = args["seed"]
 CONFIG.algorithm_params.device = args["device"]
 
 from stable_baselines3 import PPO, DDPG, SAC
-from clip.clip_rewarded_sac import CLIPRewardedSAC
+from auto_reward.auto_sac import AutoRewardedSAC
 
 from utils import VideoRecorder, parse_wrapper_class
 from carla_env.state_commons import create_encode_state_fn
@@ -56,10 +56,14 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
     state = env.reset()
 
     columns = ["model_id", "episode", "step", "throttle", "steer", "vehicle_location_x", "vehicle_location_y",
-               "reward", "distance", "speed", "center_dev", "angle_next_waypoint", "waypoint_x", "waypoint_y",
-               "route_x", "route_y", "routes_completed", "collision_speed", "collision_interval", "CPS", "CPM"
+               "reward", "learned_reward", "distance", "speed", "center_dev", "angle_next_waypoint", 
+               "waypoint_x", "waypoint_y", "route_x", "route_y", "routes_completed", 
+               "collision_speed", "collision_interval", "CPS", "CPM"
                ]
     df = pd.DataFrame(columns=columns)
+    
+    # Check if model has AutoReward learner
+    has_auto_reward = hasattr(model, 'auto_reward_learner') and model.auto_reward_learner is not None
 
     # Init video recording
     if record_video:
@@ -109,9 +113,21 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
             collision_speed, collision_interval, cps, cpm = env.collision_speed, env.collision_interval, env.cps, env.cpm
         else:
             collision_speed, collision_interval, cps, cpm = 0, None, 0, 0
+        
+        # Compute learned reward for AutoReward models
+        learned_reward = None
+        if has_auto_reward:
+            with torch.no_grad():
+                obs_tensor = torch.as_tensor(state['seg_camera']).to(model.device).float()
+                obs_tensor = obs_tensor.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+                features = model.policy.features_extractor({'seg_camera': obs_tensor})
+                action_tensor = torch.as_tensor(action).to(model.device).float().unsqueeze(0)
+                r_omega = model.auto_reward_learner.get_reward(features, action_tensor)
+                learned_reward = float(r_omega.cpu().numpy().flatten()[0])
+        
         new_row = pd.DataFrame(
             [[model_id, env.episode_idx, env.step_count, env.vehicle.control.throttle, env.vehicle.control.steer,
-              vehicle_relative[0], vehicle_relative[1], reward,
+              vehicle_relative[0], vehicle_relative[1], reward, learned_reward,
               env.distance_traveled,
               env.vehicle.get_speed(), env.distance_from_center,
               np.rad2deg(env.vehicle.get_angle(env.current_waypoint)),
@@ -146,8 +162,7 @@ if __name__ == "__main__":
         "PPO": PPO,
         "DDPG": DDPG,
         "SAC": SAC,
-        "CLIP-SAC": CLIPRewardedSAC,
-        "CLIP-PPO": CLIPRewardedPPO,
+        "SAC_AUTO": AutoRewardedSAC,
     }
     if CONFIG.algorithm not in algorithm_dict:
         raise ValueError("Invalid algorithm name")
@@ -184,12 +199,8 @@ if __name__ == "__main__":
         env = wrap_class(env, *wrap_params)
 
     # Load the model based on the algorithm type
-    if CONFIG.algorithm == "CLIP-SAC":
-        model = CLIPRewardedSAC.load(model_ckpt, env=env, config=CONFIG, device=args["device"], load_clip=False)
-        model.inference_only = True
-    elif CONFIG.algorithm == "CLIP-PPO":
-        model = CLIPRewardedPPO.load(model_ckpt, env=env, config=CONFIG, device=args["device"], load_clip=False)
-        model.inference_only = True
+    if CONFIG.algorithm == "SAC_AUTO":
+        model = AutoRewardedSAC.load(model_ckpt, env=env, config=CONFIG, device=args["device"])
     else:
         model = AlgorithmRL.load(model_ckpt, env=env, device=args["device"])
 
