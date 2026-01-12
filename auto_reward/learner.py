@@ -35,8 +35,8 @@ class AutoRewardLearner:
         self.gamma = config.gamma
         self.reward_lr = 1e-4
         self.value_lr = 3e-4 # Usually higher than reward LR
-        self.n_samples = config.algorithm_params.get('n_samples', 1000) # Number of samples for expectation estimation
-        self.reward_buffer_size = config.algorithm_params.get('reward_buffer_size', 100) # Max number of trajectories
+        self.n_samples = config.get('n_samples', 1000) # Number of samples for expectation estimation
+        self.reward_buffer_size = config.get('reward_buffer_size', 100) # Max number of trajectories
         
         # 1. Trainable Reward Function R_omega(s, a)
         self.reward_net = RewardNetwork(

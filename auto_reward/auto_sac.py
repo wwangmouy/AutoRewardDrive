@@ -36,7 +36,6 @@ class AutoRewardedSAC(SAC):
         tau: float = 0.005,
         gamma: float = 0.99,
         train_freq: Union[int, Tuple[int, str]] = 1,
-        reward_update_freq: int = 2048, # New param
         gradient_steps: int = 1,
         action_noise: Optional[ActionNoise] = None,
         replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
@@ -86,7 +85,7 @@ class AutoRewardedSAC(SAC):
             _init_setup_model,
         )
         self.config = config
-        self.reward_update_freq = reward_update_freq
+        self.reward_update_freq = config.get('reward_update_freq', 2048)
         self.auto_reward_learner = None # Initialized in _setup_model
 
     def _setup_model(self) -> None:

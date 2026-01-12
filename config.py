@@ -146,10 +146,6 @@ algorithm_params = {
             features_extractor_class=CustomMultiInputExtractor,
             features_extractor_kwargs=dict(features_dim=256),
         ),
-        # AutoReward specific parameters
-        reward_update_freq=2048,  # Frequency of meta-learning updates
-        n_samples=1000,  # Number of action samples for reward baseline estimation
-        reward_buffer_size=100,  # Max number of trajectories in meta-learning buffer
     ),
 }
 
@@ -211,6 +207,7 @@ _CONFIG_2 = {
 _CONFIG_3 = {
     "algorithm": "SAC_AUTO",
     "algorithm_params": algorithm_params["SAC_AUTO"],
+    "gamma": 0.98,  # Discount factor for AutoReward
     "state": states["5"],
     "action_smoothing": 0.75,
     "reward_fn": "reward_fn5", # Initial reward fn, will be overridden by AutoReward
@@ -221,7 +218,11 @@ _CONFIG_3 = {
     "wrappers": [],
     "action_noise": {},
     "use_seg_bev": True,
-    "use_rgb_bev": False, # No longer needed for CLIP
+    "use_rgb_bev": False,
+    # AutoReward specific parameters
+    "reward_update_freq": 2048,  # Frequency of meta-learning updates
+    "n_samples": 1000,  # Number of action samples for reward baseline estimation
+    "reward_buffer_size": 100,  # Max number of trajectories in meta-learning buffer
 }
 
 CONFIGS = {
