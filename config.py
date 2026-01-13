@@ -137,9 +137,9 @@ algorithm_params = {
         ent_coef='auto',
         gamma=0.98,
         tau=0.02,
-        train_freq=1,
-        gradient_steps=1,
-        learning_starts=1000,
+        train_freq=64,
+        gradient_steps=64,
+        learning_starts=5000,
         use_sde=True,
         policy_kwargs=dict(
             log_std_init=-1,  # Higher initial std for more exploration (exp(-1) ≈ 0.37)
@@ -215,7 +215,7 @@ _CONFIG_3 = {
     "reward_params": reward_params["reward_fn_5_default"],
     "eval_reward_params": reward_params["reward_eval"],
     "obs_res": (80, 120),
-    "seed": 42,
+    "seed": 100,
     "wrappers": [],
     "action_noise": {},
     "use_seg_bev": True,
