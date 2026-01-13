@@ -119,7 +119,7 @@ class CarlaRouteEnv(gym.Env):
 
         self.carla_process = None
         if start_carla:
-            CARLA_ROOT = "/home/wy/CARLA_0.9.13"
+            CARLA_ROOT = "/home/ubuntu/wy/CARLA_0.9.13"
             carla_path = os.path.join(CARLA_ROOT, "CarlaUE4.sh")
             launch_command = [carla_path]
             launch_command += ['-quality_level=Low']
@@ -494,6 +494,16 @@ class CarlaRouteEnv(gym.Env):
         self.previous_location = transform.location
 
         self.speed_accum += self.vehicle.get_speed()
+        
+        # Low speed timeout: terminate if vehicle is stuck (speed < 1 km/h for too long)
+        current_speed = self.vehicle.get_speed()
+        if current_speed < 3.0:  # Less than 1 km/h
+            self.low_speed_timer += 1
+            if self.low_speed_timer >= 100:  
+                self.terminal_state = True
+                print(f"{self.episode_idx}| Terminal:  Vehicle stopped")
+        else:
+            self.low_speed_timer = 0  # Reset timer when moving
 
         if self.distance_traveled >= self.max_distance and not self.eval:
             self.success_state = True
@@ -614,7 +624,7 @@ class CarlaRouteEnv(gym.Env):
                 color = (255, 0, 0)
             else:
                 color = (0, 0, 255)
-            image = cv2.circle(image, (x, y), radius=3, color=color, thickness=-1)
+            image = cv2.circle(image, (int(x), int(y)), radius=3, color=color, thickness=-1)
         return image
 
     def _get_observation(self):

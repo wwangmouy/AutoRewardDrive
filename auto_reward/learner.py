@@ -54,6 +54,8 @@ class AutoRewardLearner:
         # 3. Data Storage
         self.D_xi = deque(maxlen=self.reward_buffer_size) # Trajectory buffer
         self.current_episode_data = [] # Temp storage for current episode
+        self._pending_transitions = []  # Batch processing buffer
+        self._batch_size = 64  # Process every N steps
         
     def get_reward(self, state, action):
         """
@@ -112,7 +114,7 @@ class AutoRewardLearner:
 
     def optimize_reward(self, agent_policy_func):
         """
-        Meta-Optimization Step .
+        Meta-Optimization Step.
         
         Args:
             agent_policy_func: Function to resample actions from mu. 
@@ -126,85 +128,109 @@ class AutoRewardLearner:
         # Shuffle for i.i.d updates
         random.shuffle(all_steps)
         
-        # Process step-by-step as per official code (or batched if possible)
-        accumulator_1 = [] # (R_hat - E[R])
-        accumulator_2 = [] # pi(a|s) * (V_bar - V(s))
+        total_steps = len(all_steps)
         
+        # --- Phase 1: Compute loss_val_term (C) ---
+        # This requires iterating all data but is cheap (inference only, no graph)
+        accumulator_2 = []
         states_list = []
         overline_V_list = []
         
         for step in all_steps:
-            # Unpack
             s_np, a_np, r_bar, log_prob_np, mu, overline_V = step
             
-            # Convert to Tensor
             s = torch.tensor(s_np, device=self.device).float()
+            prob_a = np.exp(log_prob_np)
             
-            prob_a = np.exp(log_prob_np) # pi(a|s) scalar
-            # NOTE: Official code uses prob_a directly. 
-            # If log_prob_np is log probability density, exp(log_prob) could be > 1. 
-            # Code assumes this ratio/weight acts as part of the gradient scale.
+            # Estimate V(s) (No grad)
+            with torch.no_grad():
+                V_s = self.value_net(s.unsqueeze(0)).item()
             
-            # 1. Estimate V(s) using our ValueFunction
-            V_s = self.value_net(s.unsqueeze(0)).item() # Scalar
-            
-            # 2. Advantage (V_bar - V(s))
             advantage = overline_V - V_s
-            
-            # Accumulator 2: weighting term
             accumulator_2.append(prob_a * advantage)
-            
-            # 3. Reward Baseline Computation
-            # Re-compute R_omega(s, a)
-            a_tensor = torch.tensor(a_np, device=self.device).float().unsqueeze(0)
-            r_omega_cur = self.reward_net(s.unsqueeze(0), a_tensor).squeeze(0) # [1]
-            
-            # Sample N actions from pi(.|s) using mu
-            action_samples, log_prob_samples = agent_policy_func(mu, self.n_samples)
-            
-            # Expand state
-            s_expanded = s.unsqueeze(0).repeat(self.n_samples, 1) # [N, state_dim]
-            
-            # Compute R_omega(s, a') for all samples
-            r_omega_samples = self.reward_net(s_expanded, action_samples) # [N, 1]
-            
-            # Expectation: mean(R)
-            reward_baseline = torch.mean(r_omega_samples)
-            
-            # Accumulator 1: (R(s,a) - Baseline)
-            accumulator_1.append(r_omega_cur - reward_baseline)
             
             # Collect data for Value update
             states_list.append(s_np)
             overline_V_list.append(overline_V)
 
-        # ---- Stack and Compute Loss ----
-        # Loss = Mean(Acc2) * Mean(Acc1)
-        loss_val_term = torch.stack(accumulator_2).mean() 
-        loss_reward_term = torch.stack(accumulator_1).mean() 
+        # C = Mean(Acc2)
+        loss_val_term = torch.tensor(accumulator_2, device=self.device).mean()
         
-        loss = loss_val_term * loss_reward_term
-        
-        # Optimize R_omega
+        # --- Phase 2: Compute Reward Gradients in Batches ---
         self.reward_optimizer.zero_grad()
-        loss.backward()
+        
+        batch_size = self._batch_size
+        total_reward_loss_sum = 0.0
+        
+        for i in range(0, total_steps, batch_size):
+            batch_steps = all_steps[i : i + batch_size]
+            current_batch_size = len(batch_steps)
+            
+            batch_acc_1 = []
+            
+            for step in batch_steps:
+                s_np, a_np, r_bar, log_prob_np, mu, overline_V = step
+                
+                s = torch.tensor(s_np, device=self.device).float()
+                a_tensor = torch.tensor(a_np, device=self.device).float().unsqueeze(0)
+                
+                # Re-compute R_omega(s, a)
+                r_omega_cur = self.reward_net(s.unsqueeze(0), a_tensor).squeeze(0)
+                
+                # Sample N actions
+                action_samples, log_prob_samples = agent_policy_func(mu, self.n_samples)
+                
+                # Expand state
+                s_expanded = s.unsqueeze(0).repeat(self.n_samples, 1)
+                
+                # Compute R_omega(s, a') for all samples
+                r_omega_samples = self.reward_net(s_expanded, action_samples)
+                
+                # Expectation: mean(R)
+                reward_baseline = torch.mean(r_omega_samples)
+                
+                batch_acc_1.append(r_omega_cur - reward_baseline)
+            
+            # Compute batch loss
+            # Loss = C * Mean(Acc1)
+            # Contribution = C * Sum(Acc1_batch) / N = C * Mean(Acc1_batch) * B / N
+            loss_reward_batch = torch.stack(batch_acc_1).mean()
+            weighted_loss = loss_val_term * loss_reward_batch * (current_batch_size / total_steps)
+            
+            weighted_loss.backward()
+            total_reward_loss_sum += loss_reward_batch.item() * current_batch_size
+
         self.reward_optimizer.step()
         
-        # Optimize V(s)
+        # --- Phase 3: Optimize Value Function ---
         # Regress V(s) -> overline_V
-        states_tensor = torch.tensor(np.array(states_list), device=self.device).float()
-        targets_tensor = torch.tensor(np.array(overline_V_list), device=self.device).float().unsqueeze(1)
-        
-        preds = self.value_net(states_tensor)
-        v_loss = nn.functional.smooth_l1_loss(preds, targets_tensor)
-        
+        # Use mini-batches for value update as well to be safe
         self.value_optimizer.zero_grad()
-        v_loss.backward()
+        
+        states_tensor_all = torch.tensor(np.array(states_list), device=self.device).float()
+        targets_tensor_all = torch.tensor(np.array(overline_V_list), device=self.device).float().unsqueeze(1)
+        
+        value_loss_sum = 0.0
+        
+        for i in range(0, total_steps, batch_size):
+            end_idx = min(i + batch_size, total_steps)
+            s_batch = states_tensor_all[i:end_idx]
+            target_batch = targets_tensor_all[i:end_idx]
+            
+            preds = self.value_net(s_batch)
+            v_loss = nn.functional.smooth_l1_loss(preds, target_batch)
+            
+            # Scale loss by batch size ratio for correct mean
+            v_loss_scaled = v_loss * ((end_idx - i) / total_steps)
+            v_loss_scaled.backward()
+            
+            value_loss_sum += v_loss.item() * (end_idx - i)
+            
         self.value_optimizer.step()
         
         return {
-            "meta_loss": loss.item(),
-            "value_loss": v_loss.item(),
-            "mean_R_omega": loss_reward_term.item(),
+            "meta_loss": (loss_val_term * (total_reward_loss_sum / total_steps)).item(),
+            "value_loss": value_loss_sum / total_steps,
+            "mean_R_omega": total_reward_loss_sum / total_steps,
             "mean_Advantage": loss_val_term.item()
         }

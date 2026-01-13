@@ -110,26 +110,29 @@ class AutoRewardedSAC(SAC):
                 obs_tensor, _ = self.policy.obs_to_tensor(self._last_obs)
                 features = self.actor.extract_features(obs_tensor, self.actor.features_extractor)
                 mean_actions, log_std, _ = self.actor.get_action_dist_params(obs_tensor)
-                mu = (mean_actions.cpu(), log_std.cpu())
+                # Use non_blocking to reduce sync overhead
+                mu = (mean_actions.detach(), log_std.detach())  # Keep on GPU, transfer later
                 actions, log_probs = self.actor.action_log_prob(obs_tensor)
-                actions = actions.cpu().numpy()
-                log_probs = log_probs.cpu().numpy()
+                actions_np = actions.cpu(memory_format=torch.contiguous_format).numpy()
+                log_probs_np = log_probs.cpu(memory_format=torch.contiguous_format).numpy()
+                
+                # Compute learned reward R_omega inline (avoid redundant tensor conversion)
+                r_omega = self.auto_reward_learner.get_reward(features, actions)
+                r_omega_val = r_omega.cpu(memory_format=torch.contiguous_format).numpy().flatten()
+                
+                # Cache features on CPU (single transfer)
+                features_cpu = features.cpu(memory_format=torch.contiguous_format).numpy().flatten()
+                mu_cpu = (mu[0][0].cpu(), mu[1][0].cpu())
 
-            new_obs, rewards, dones, infos = env.step(actions)
-
-            # Compute learned reward R_omega
-            with torch.no_grad():
-                actions_tensor = torch.as_tensor(actions).to(self.device).float()
-                r_omega = self.auto_reward_learner.get_reward(features, actions_tensor)
-                r_omega_val = r_omega.cpu().numpy().flatten()
+            new_obs, rewards, dones, infos = env.step(actions_np)
             
             # Store for meta-learning (ground truth reward)
             self.auto_reward_learner.store_transition(
-                state=features.cpu().numpy().flatten(),
-                action=actions.flatten(),
+                state=features_cpu,
+                action=actions_np.flatten(),
                 reward=rewards[0],
-                log_prob=log_probs.flatten()[0],
-                mu=(mu[0][0], mu[1][0])
+                log_prob=log_probs_np.flatten()[0],
+                mu=mu_cpu
             )
 
             self.num_timesteps += env.num_envs
@@ -146,7 +149,7 @@ class AutoRewardedSAC(SAC):
                         real_next_obs[idx] = infos[idx]["terminal_observation"]
             
             # Store with learned reward
-            self.replay_buffer.add(self._last_obs, real_next_obs, actions, r_omega_val, dones, infos)
+            self.replay_buffer.add(self._last_obs, real_next_obs, actions_np, r_omega_val, dones, infos)
             self._last_obs = new_obs
             
             # Update callback locals for TensorboardCallback
