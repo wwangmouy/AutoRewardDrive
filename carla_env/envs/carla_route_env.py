@@ -624,7 +624,10 @@ class CarlaRouteEnv(gym.Env):
                 color = (255, 0, 0)
             else:
                 color = (0, 0, 255)
-            image = cv2.circle(image, (int(x), int(y)), radius=3, color=color, thickness=-1)
+            # Ensure x and y are Python native int, not numpy types
+            center_x = int(round(float(x)))
+            center_y = int(round(float(y)))
+            image = cv2.circle(image, (center_x, center_y), radius=3, color=color, thickness=-1)
         return image
 
     def _get_observation(self):
