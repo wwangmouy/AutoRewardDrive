@@ -26,8 +26,8 @@ def create_reward_fn(reward_fn):
             else:
                 env.low_speed_timer = 0.0  # Reset timer if speed goes above threshold
 
-            # Check if speed is low for 90 consecutive second
-            if env.low_speed_timer >= 90 * env.fps:
+            # Check if speed is low for 90 consecutive second (only during training)
+            if env.low_speed_timer >= 90 * env.fps and not env.eval:
                 env.terminal_state = True
                 terminal_reason = "Vehicle stopped"
 
@@ -40,6 +40,7 @@ def create_reward_fn(reward_fn):
             if max_speed > 0 and speed > max_speed and not env.eval:
                 env.terminal_state = True
                 terminal_reason = "Too fast"
+
 
         # Calculate reward
         reward = 0

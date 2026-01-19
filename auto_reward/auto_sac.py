@@ -84,6 +84,81 @@ class AutoRewardedSAC(SAC):
         )
         print(f"[AutoRewardedSAC] Initialized: state_dim={state_dim}, action_dim={action_dim}")
 
+    @classmethod
+    def load(
+        cls,
+        path: str,
+        env: Optional[GymEnv] = None,
+        config: Optional[Any] = None,
+        device: Union[torch.device, str] = "auto",
+        **kwargs
+    ):
+        """
+        Load AutoRewardedSAC model from file.
+        
+        Args:
+            path: Path to the saved model
+            env: Environment (required for model loading)
+            config: Config object (required for AutoRewardedSAC)
+            device: Device to load the model on
+            **kwargs: Additional arguments
+        """
+        if config is None:
+            raise ValueError("config argument is required for AutoRewardedSAC.load()")
+        
+        # First, manually set the config as a class variable temporarily
+        # so __init__ can access it during the parent's load process
+        cls._temp_config = config
+        
+        # Use parent SAC class load method directly
+        # This will create an instance but __init__ won't have config parameter
+        # So we need a workaround
+        
+        # Load using parent class but we need to inject config before init
+        # The solution: Create instance manually, then load parameters
+        from stable_baselines3.common.save_util import load_from_zip_file
+        
+        data, params, pytorch_variables = load_from_zip_file(
+            path,
+            device=device,
+            custom_objects=kwargs.get("custom_objects"),
+            print_system_info=kwargs.get("print_system_info", False)
+        )
+        
+        # Create the model instance with config
+        model = cls(
+            policy=data["policy_class"],
+            env=env,
+            config=config,
+            device=device,
+            _init_setup_model=False,  # Don't setup yet
+        )
+        
+        # Restore all saved attributes
+        model.__dict__.update(data)
+        model.__dict__.update(kwargs)
+        
+        # Now setup the model (this will initialize auto_reward_learner)
+        model._setup_model()
+        
+        # Load the neural network parameters
+        model.set_parameters(params, exact_match=True, device=device)
+        
+        # Restore pytorch-specific variables
+        model.__dict__.update(pytorch_variables)
+        
+        # Set the environment if provided
+        if env is not None:
+            model.set_env(env, force_reset=kwargs.get("force_reset", True))
+        
+        # Clean up temp variable
+        if hasattr(cls, '_temp_config'):
+            delattr(cls, '_temp_config')
+        
+        return model
+
+
+
     def collect_rollouts(
         self,
         env: VecEnv,

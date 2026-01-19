@@ -495,11 +495,13 @@ class CarlaRouteEnv(gym.Env):
 
         self.speed_accum += self.vehicle.get_speed()
         
-        # Low speed timeout: terminate if vehicle is stuck (speed < 1 km/h for too long)
+        # Low speed timeout: terminate if vehicle is stuck (speed < 3 km/h for too long)
+        # 300 frames @ 15 fps = 20 seconds (allows time for waiting behind other vehicles)
+        # Only applies during training, not evaluation
         current_speed = self.vehicle.get_speed()
-        if current_speed < 3.0:  # Less than 1 km/h
+        if current_speed < 3.0:  # Less than 3 km/h
             self.low_speed_timer += 1
-            if self.low_speed_timer >= 100:  
+            if self.low_speed_timer >= 100 and not self.eval:  # 20 seconds at 25 fps
                 self.terminal_state = True
                 print(f"{self.episode_idx}| Terminal:  Vehicle stopped")
         else:
