@@ -363,6 +363,48 @@ def reward_fn_Chen(env):
 reward_functions["reward_fn_Chen"] = create_reward_fn(reward_fn_Chen)
 
 
+def reward_fn_minimal_fdpf(env):
+    """
+    A Minimalist Ground Truth Reward.
+    Philosophy: "Tell the agent WHAT (Fast + Safe), not HOW (steering, centering)."
+    
+    Components:
+    1. Efficiency: Speed (Normalized)
+    2. Safety: FDPF Intensity (Penalty)
+    
+    Formula:
+    R = (Speed / Target_Speed) - lambda * tanh(FDPF)
+    """
+    
+    # 1. Efficiency: Just linear speed reward up to target.
+    # We want it to be fast, but not crazy fast.
+    speed_kmh = env.vehicle.get_speed()
+    target_speed_val = 25.0 # From config or use variable
+    
+    # Normalized speed [0, 1] approximately
+    r_speed = min(speed_kmh / target_speed_val, 1.0)
+    
+    # 2. Safety: FDPF (includes lane boundaries and obstacles)
+    # The FDPF intensity grows exponentially near obstacles/boundaries.
+    # tanh wraps it to [0, 1] range for stability.
+    fdpf_intensity = getattr(env, 'fdpf_intensity', 0.0)
+    r_safety = -1.0 * np.tanh(fdpf_intensity)
+    
+    # 3. Hard Constraints (Optional but recommended for RL stability)
+    # If collision, immediate heavy penalty.
+    if env.collision_state:
+        return -1.0
+        
+    # Total
+    # Weights: Speed (1.0) + Safety (1.0). 
+    # The Meta-Learner will balance them based on value estimation.
+    total_reward = r_speed + r_safety
+    
+    return np.clip(total_reward, -1, 1)
+
+reward_functions["reward_fn_minimal_fdpf"] = create_reward_fn(reward_fn_minimal_fdpf)
+
+
 def reward_fn_ASAP(env):
     """
     ASAP (Approximate Safe Action Policy) reward function that combines multiple factors:

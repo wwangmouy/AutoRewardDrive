@@ -17,6 +17,11 @@ from carla_env.wrappers import *
 import carla
 from collections import deque
 import itertools
+from safe_field import FDPF
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend  
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 intersection_routes = itertools.cycle(
     [(57, 81), (70, 11), (70, 12), (78, 68), (74, 41), (42, 73), (71, 62), (74, 40), (71, 77), (6, 12), (65, 52),
@@ -119,7 +124,7 @@ class CarlaRouteEnv(gym.Env):
 
         self.carla_process = None
         if start_carla:
-            CARLA_ROOT = "/home/ubuntu/wy/CARLA_0.9.13"
+            CARLA_ROOT = "/home/wy/CARLA_0.9.13"
             carla_path = os.path.join(CARLA_ROOT, "CarlaUE4.sh")
             launch_command = [carla_path]
             launch_command += ['-quality_level=Low']
@@ -142,7 +147,17 @@ class CarlaRouteEnv(gym.Env):
             out_width, out_height = obs_res
         self.activate_render = activate_render
 
+        # Increase window height to accommodate 3 panels vertically (BEV, RGB, FDPF)
+        # Original height: 560, New height: 840 (to fit 3x 280px panels)
+        display_width = width
+        display_height = max(height, 840)  # Ensure at least 840px height for 3 panels
+
         self.num_envs = 1
+
+        # Initialize FDPF
+        self.fdpf = FDPF()
+        self.fdpf.vehicle_width = 2.0 # Approx width
+        self.fdpf.lane_width = 3.5 # Approx lane width
 
         # Setup gym environment
         self.action_space_type = action_space_type
@@ -218,9 +233,9 @@ class CarlaRouteEnv(gym.Env):
             if self.activate_render:
                 pygame.init()
                 pygame.font.init()
-                self.display = pygame.display.set_mode((width, height), pygame.HWSURFACE | pygame.DOUBLEBUF)
+                self.display = pygame.display.set_mode((display_width, display_height), pygame.HWSURFACE | pygame.DOUBLEBUF)
                 self.clock = pygame.time.Clock()
-                self.hud = HUD(width, height)
+                self.hud = HUD(display_width, display_height)
                 self.hud.set_vehicle(self.vehicle)
                 self.world.on_tick(self.hud.on_world_tick)
 
@@ -361,6 +376,81 @@ class CarlaRouteEnv(gym.Env):
             for actor in actors:
                 actor.destroy()
 
+    def _generate_fdpf_heatmap(self, size=(280, 280)):
+        """
+        Generate FDPF safety field heatmap as RGB image.
+        Returns numpy array of shape (height, width, 3) for pygame display.
+        """
+        # Create small grid for real-time visualization
+        grid_l = np.linspace(-8, 8, 40)  # Lateral
+        grid_s = np.linspace(-5, 25, 60)  # Longitudinal
+        
+        L, S = np.meshgrid(grid_l, grid_s)
+        intensity_grid = np.zeros_like(L)
+        
+        # Get ego speed
+        ego_v = self.vehicle.get_velocity()
+        ego_speed = np.sqrt(ego_v.x**2 + ego_v.y**2)
+        
+        # Calculate intensity at each grid point using current FDPF state
+        for i in range(len(grid_s)):
+            for j in range(len(grid_l)):
+                try:
+                    intensity, intensity_with_bound, _, _, _, _ = self.fdpf.getIntensityAt(
+                        S[i, j], L[i, j], 0.0, ego_speed
+                    )
+                    intensity_grid[i, j] = min(intensity_with_bound, 3.0)  # Cap for visualization
+                except:
+                    intensity_grid[i, j] = 0.0
+        
+        # Create matplotlib figure
+        fig = plt.figure(figsize=(3, 3), dpi=100)
+        ax = fig.add_subplot(111)
+        
+        # Plot heatmap
+        im = ax.contourf(L, S, intensity_grid, levels=15, cmap='RdYlBu_r', alpha=0.9)
+        
+        # Draw ego vehicle as green rectangle at origin
+        from matplotlib.patches import Rectangle
+        ego_rect = Rectangle((-1.0, -1.5), 2.0, 3.0, 
+                             linewidth=2, edgecolor='black', facecolor='lime', alpha=0.8)
+        ax.add_patch(ego_rect)
+        
+        # Draw lane markings
+        ax.axvline(x=-3.5, color='white', linestyle='-', linewidth=2, alpha=0.8)
+        ax.axvline(x=3.5, color='white', linestyle='-', linewidth=2, alpha=0.8)
+        ax.axvline(x=0, color='yellow', linestyle='--', linewidth=1, alpha=0.6)
+        
+        # Labels and formatting
+        ax.set_xlabel('Lateral (m)', fontsize=8)
+        ax.set_ylabel('Longitudinal (m)', fontsize=8)
+        ax.set_title(f'FDPF Safety Field\nMax: {intensity_grid.max():.2f}', fontsize=9, fontweight='bold')
+        ax.set_xlim(-8, 8)
+        ax.set_ylim(-5, 25)
+        ax.grid(True, alpha=0.2, linestyle=':')
+        ax.tick_params(labelsize=7)
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Risk', fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+        
+        plt.tight_layout()
+        
+        # Convert to numpy array
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        buf = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
+        img = buf.reshape(canvas.get_width_height()[::-1] + (4,))
+        img_rgb = img[:, :, :3]  # Remove alpha channel
+        
+        plt.close(fig)
+        
+        # Resize to requested size
+        img_resized = cv2.resize(img_rgb, size, interpolation=cv2.INTER_LINEAR)
+        
+        return img_resized
+
     def render(self, mode="human"):
         if mode == "rgb_array_no_hud":
             return self.viewer_image
@@ -405,16 +495,34 @@ class CarlaRouteEnv(gym.Env):
             self.viewer_image = self._draw_path(self.camera, self.viewer_image)
             self.display.blit(pygame.surfarray.make_surface(self.viewer_image.swapaxes(0, 1)), (0, 0))
 
-            new_size = (self.display.get_size()[1] // 2, self.display.get_size()[1] // 2)
-            pos_bev = (self.display.get_size()[0] - self.display.get_size()[1] // 2, self.display.get_size()[1] // 2)
+            # Calculate size for right column panels (BEV, RGB, FDPF)
+            # Each panel gets 1/3 of window height
+            panel_width = self.display.get_size()[1] // 2
+            panel_height = self.display.get_size()[1] // 3
+            panel_size = (panel_width, panel_height)
+            right_x = self.display.get_size()[0] - panel_width
+            
+            # Top: BEV
+            pos_bev = (right_x, 0)
             bev_surface = pygame.surfarray.make_surface(self.bev_spectator_data.swapaxes(0, 1))
-            scaled_surface = pygame.transform.scale(bev_surface, new_size)
+            scaled_surface = pygame.transform.scale(bev_surface, panel_size)
             self.display.blit(scaled_surface, pos_bev)
 
-            pos_obs = (self.display.get_size()[0] - self.display.get_size()[1] // 2, 0)
+            # Middle: RGB Observation
+            pos_obs = (right_x, panel_height)
             obs_surface = pygame.surfarray.make_surface(self.observation_render.swapaxes(0, 1))
-            scaled_surface = pygame.transform.scale(obs_surface, new_size)
+            scaled_surface = pygame.transform.scale(obs_surface, panel_size)
             self.display.blit(scaled_surface, pos_obs)
+
+            # Bottom: FDPF Safety Field
+            if hasattr(self, 'fdpf') and self.fdpf is not None:
+                try:
+                    fdpf_image = self._generate_fdpf_heatmap(size=panel_size)
+                    pos_fdpf = (right_x, panel_height * 2)
+                    fdpf_surface = pygame.surfarray.make_surface(fdpf_image.swapaxes(0, 1))
+                    self.display.blit(fdpf_surface, pos_fdpf)
+                except Exception as e:
+                    pass  # Silent fail if FDPF visualization fails
 
         self.hud.render(self.display, extra_info=self.extra_info)
         self.extra_info = []
@@ -513,6 +621,182 @@ class CarlaRouteEnv(gym.Env):
         self.last_reward = self.reward_fn(self)
         self.total_reward += self.last_reward
 
+        
+        # --- FDPF Update ---
+        # 1. Get surrounding vehicles
+        vehicles = self.world.get_actors().filter('vehicle.*')
+        neighborhood_grids = [[[] for _ in range(3)] for _ in range(3)]
+        
+        # Ego vars
+        ego_trans = self.vehicle.get_transform()
+        ego_loc = ego_trans.location
+        ego_v = self.vehicle.get_velocity()
+        ego_speed = np.sqrt(ego_v.x**2 + ego_v.y**2)
+        
+        # We define a local Frenet system relative to the route
+        # For simplicity in this integration step, we treat:
+        # s = distance along route from ego (positive = ahead)
+        # l = lateral distance from route center (positive = left)
+        
+        # Pre-fetch waypoints for projection (window around current)
+        window_size = 50
+        start_idx = max(0, self.current_waypoint_index - 10)
+        end_idx = min(len(self.route_waypoints), self.current_waypoint_index + window_size)
+        local_waypoints = [wp[0] for wp in self.route_waypoints[start_idx:end_idx]]
+        
+        if not local_waypoints:
+             local_waypoints = [self.current_waypoint]
+
+        def get_s_l(actor_loc):
+            # Find closest waypoint in local window
+            min_dist = float('inf')
+            closest_wp_idx = -1
+            
+            for idx, wp in enumerate(local_waypoints):
+                d = actor_loc.distance(wp.transform.location)
+                if d < min_dist:
+                    min_dist = d
+                    closest_wp_idx = idx
+            
+            ref_wp = local_waypoints[closest_wp_idx]
+            
+            # Simple Frenet approximation
+            # s = accumulated distance along waypoints from ego's closest wp
+            # But we want relative S to ego.
+            # Let's approximate: 
+            # Vector from Ego-WP to Actor-WP
+            
+            # More robust: Project actor onto the vector of the closest waypoint
+            wp_trans = ref_wp.transform
+            wp_loc = wp_trans.location
+            wp_fwd = wp_trans.get_forward_vector()
+            wp_right = wp_trans.get_right_vector()
+            
+            vec = vector(actor_loc - wp_loc)
+            
+            # Longitudinal projection on WP heading
+            s_proj = vec.x * wp_fwd.x + vec.y * wp_fwd.y + vec.z * wp_fwd.z
+            
+            # Lateral projection
+            l_proj = vec.x * wp_right.x + vec.y * wp_right.y + vec.z * wp_right.z
+            # l_proj is positive to the right in UE4/Carla (Right Vector), but FDPF might expect Left.
+            # FDPF logic: relative_direction = atan2(l, s). 
+            # If l is positive left, and we use standard math, it's fine.
+            # CARLA Right vector points Right. So Left is -Right.
+            l_proj = -l_proj 
+            
+            # Global S difference
+            # S of ego roughly at index 0 of our relative window? No.
+            # We calculate index difference
+            
+            # Distance from ego wp to actor wp along route
+            # This is expensive to sum every time.
+            # Approx: linear index difference * resolution?
+            # Better: just use s_proj + distance_between_wps
+            
+            # Let's simplify: 
+            # s = (Index_Actor - Index_Ego) * resolution + s_proj_correction
+            # Assuming ~1m resolution which is typical in carla_route_env if not specified otherwise
+            # compute_route_waypoints uses resolution=1.0 default
+            
+            # Find ego index in local_waypoints
+            # We know ego is close to self.current_waypoint_index
+            # which roughly corresponds to start_idx + (closest_wp_idx_of_ego)
+            
+            return closest_wp_idx, s_proj, l_proj
+
+        # Ego relative S, L
+        ego_wp_idx, ego_s_proj, ego_l_proj = get_s_l(ego_loc)
+        # We treat Ego as S=0, L=ego_l_proj (deviation from center)
+        # Actually FDPF expects ego_s, ego_l inputs.
+        
+        ego_s_fdpf = 0.0
+        ego_l_fdpf = ego_l_proj 
+        
+        # Fill grid
+        for veh in vehicles:
+            if veh.id == self.vehicle.id:
+                continue
+                
+            veh_loc = veh.get_transform().location
+            # Filter distant vehicles (> 50m)
+            if veh_loc.distance(ego_loc) > 40:
+                continue
+                
+            w_idx, s_proj, l_proj = get_s_l(veh_loc)
+            
+            # Calculate relative S
+            # S_diff = (Waypoint_Distance) + (Projection_Diff)
+            # Waypoint distance approx:
+            s_diff_params = (w_idx - ego_wp_idx) * 1.0 # 1.0m resolution
+            s_val = ego_s_fdpf + s_diff_params + (s_proj - ego_s_proj)
+            l_val = l_proj
+            
+            # Relative speed
+            v_vec = veh.get_velocity()
+            v_scalar = np.sqrt(v_vec.x**2 + v_vec.y**2)
+            
+            # Yaw relative to lane
+            # We assume vehicle is roughly aligned with lane for simplicity or calc difference
+            # FDPF uses v_x = v * cos(yaw), v_y = v * sin(yaw)
+            # Yaw should be relative to the road heading at that point
+            veh_yaw = veh.get_transform().rotation.yaw
+            wp_yaw = local_waypoints[w_idx].transform.rotation.yaw
+            delta_yaw = np.deg2rad(veh_yaw - wp_yaw)
+            
+            # Determine Grid Cell
+            # S: 0->Back, 1->Near, 2->Far
+            # L: 0->Right, 1->Center, 2->Left (Relative to Ego Lane?)
+            
+            # FDPF Grid Usage in calculating intensity:
+            # for (s_index, l_index) in [(1,0), (1,1), (1,2), (2,0), (2,1), (2,2)]:
+            # Processing Near(1) and Far(2) in S.
+            
+            # Define boundaries for grid
+            # Radius approx 10m for "Near", >10m for "Far"?
+            # Or based on strictly relative position?
+            
+            s_rel = s_val - ego_s_fdpf
+            l_rel = l_val - ego_l_fdpf
+            
+            # Oncoming vehicle detection (Town02 dual-lane)
+            is_oncoming = (l_rel < -1.75) and (abs(delta_yaw) > np.pi / 2)
+            effective_speed = v_scalar * 2.0 if is_oncoming else v_scalar
+            
+            s_idx = -1
+            if -10 < s_rel <= 10: s_idx = 1
+            elif s_rel > 10: s_idx = 2
+            elif s_rel < -10: s_idx = 0
+            
+            l_idx = -1
+            if l_rel > 1.75: l_idx = 0 # Left
+            elif l_rel < -1.75: l_idx = 2 # Right
+            else: l_idx = 1 # Center
+            
+            if s_idx != -1 and l_idx != -1:
+                 neighborhood_grids[s_idx][l_idx].append((s_val, l_val, delta_yaw, effective_speed))
+
+        # Update FDPF
+        # Dynamically get actual lane width from current waypoint
+        if self.current_waypoint is not None:
+            actual_lane_width = self.current_waypoint.lane_width
+            self.fdpf.lane_width = actual_lane_width if actual_lane_width > 0 else 3.5  # Fallback to 3.5m
+        
+        self.fdpf.update(neighborhood_grids)
+        
+        # FDPF inputs for ego
+        # Ego delta yaw relative to road
+        ego_yaw = ego_trans.rotation.yaw
+        ego_wp_yaw = local_waypoints[ego_wp_idx].transform.rotation.yaw
+        ego_delta_yaw = np.deg2rad(ego_yaw - ego_wp_yaw)
+
+        (intensity, intensity_with_bound, frenet_direction,
+         intensity_s, intensity_l, intensity_bound) = self.fdpf.getIntensityAt(
+             ego_s_fdpf, ego_l_fdpf, ego_delta_yaw, ego_speed
+         )
+         
+        self.fdpf_intensity = intensity_with_bound # Use bound version for total risk
+
         encoded_state = self.encode_state_fn(self)
         self.step_count += 1
         self.total_steps += 1
@@ -564,6 +848,7 @@ class CarlaRouteEnv(gym.Env):
             "collision_rate": sum(self.collision_deque) / len(self.collision_deque) if self.collision_deque else 0.0,
             "episode_length": self.step_count,
             "collision_state": self.collision_state,
+            "fdpf_intensity": getattr(self, 'fdpf_intensity', 0.0),
         }
 
         if self.terminal_state or self.success_state:

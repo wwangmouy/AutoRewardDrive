@@ -1,1 +1,0 @@
-python train.py --config 3 --total_timesteps 1000000 --device cuda:0 --host localhost --port 2000 --fps 15 --start_carla
