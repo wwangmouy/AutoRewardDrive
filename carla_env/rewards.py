@@ -285,6 +285,25 @@ def reward_fn_simple(env):
 
 reward_functions["reward_fn_simple"] = create_reward_fn(reward_fn_simple)
 
+def reward_fn5_simple(env):
+    """
+    Minimal reward function with only two components:
+    - Reach destination: +1
+    - Fail to reach destination (terminal without success): -1
+    - Otherwise: 0
+    """
+    terminal = env.terminal_state
+    success = env.success_state
+    
+    if success:
+        return 1
+    elif terminal:
+        return -1
+    else:
+        return 0
+
+reward_functions["reward_fn5_simple"] = create_reward_fn(reward_fn5_simple)
+
 def reward_fn5(env):
     """
         reward = Positive speed reward for being close to target speed,

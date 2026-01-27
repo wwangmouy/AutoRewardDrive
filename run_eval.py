@@ -15,11 +15,11 @@ def kill_carla():
 
 if __name__ == '__main__':
     # change the ckp as you want
-    selected_models = [f"model_{i}_steps.zip" for i in [500000]]
+    selected_models = [f"model_{i}_steps.zip" for i in [290000]]
     tensorboard_path = './tensorboard'
     
     # change the target model dir as you want
-    target_model_dir = '/home/ubuntu/wy/AutoRewardDrive/tensorboard/AutoRewardedSAC_20260115_115435_id3'
+    target_model_dir = '/home/ubuntu/wy/AutoRewardDrive/tensorboard/AutoRewardedSAC_20260119_211107_id3'
     print(f"Processing training: {target_model_dir}")
     print("=" * 60)
     

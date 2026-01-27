@@ -197,7 +197,7 @@ class CarlaRouteEnv(gym.Env):
         self.world = None
         try:
             self.client = carla.Client(host, port)
-            self.client.set_timeout(5.0)
+            self.client.set_timeout(30.0)  # Increased timeout for map loading
             self.world = World(self.client, town=town)
 
             settings = self.world.get_settings()
