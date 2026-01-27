@@ -1,3 +1,14 @@
+
+# 启动训练命令
+python train.py --config 3 --total_timesteps 1000000 --device cuda:0 --host localhost --port 2000 --fps 15 --start_carla --no_render
+
+# 启动CARLA服务器
+CUDA_VISIBLE_DEVICES=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json __NV_PROME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=NVIDIA ./CarlaUE4.sh -RenderOffScreen -quality-level=Low -carla-port=2000
+
+
+
+
+
 # AutoRewardDrive - 训练启动指南
 
 ## 快速启动

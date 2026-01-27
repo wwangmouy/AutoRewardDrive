@@ -118,12 +118,21 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
         learned_reward = None
         if has_auto_reward:
             with torch.no_grad():
-                obs_tensor = torch.as_tensor(state['seg_camera']).to(model.device).float()
-                obs_tensor = obs_tensor.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
-                features = model.policy.features_extractor({'seg_camera': obs_tensor})
+                # Prepare full observation dict for features extractor
+                obs_dict = {}
+                obs_dict['seg_camera'] = torch.as_tensor(state['seg_camera']).to(model.device).float().permute(2, 0, 1).unsqueeze(0)
+                obs_dict['vehicle_measures'] = torch.as_tensor(state['vehicle_measures']).to(model.device).float().unsqueeze(0)
+                obs_dict['waypoints'] = torch.as_tensor(state['waypoints']).to(model.device).float().unsqueeze(0)
+                
+                # Extract features using the actor's feature extractor
+                features = model.actor.extract_features(
+                    obs_dict,
+                    model.actor.features_extractor
+                )
                 action_tensor = torch.as_tensor(action).to(model.device).float().unsqueeze(0)
                 r_omega = model.auto_reward_learner.get_reward(features, action_tensor)
                 learned_reward = float(r_omega.cpu().numpy().flatten()[0])
+        
         
         new_row = pd.DataFrame(
             [[model_id, env.episode_idx, env.step_count, env.vehicle.control.throttle, env.vehicle.control.steer,

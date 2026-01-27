@@ -365,42 +365,44 @@ reward_functions["reward_fn_Chen"] = create_reward_fn(reward_fn_Chen)
 
 def reward_fn_minimal_fdpf(env):
     """
-    A Minimalist Ground Truth Reward.
-    Philosophy: "Tell the agent WHAT (Fast + Safe), not HOW (steering, centering)."
+    Ground Truth Reward with Balanced Scaling.
+    
+    Philosophy: Tell the agent WHAT (Fast + Safe), not HOW (steering, centering).
+    
+    Range: [-2, 1] where:
+    - Collision: -2.0 (clear worst case, ~2x normal worst)
+    - Normal worst (severe off-road): ~-0.5
+    - Normal best (fast + safe): +1.0
     
     Components:
-    1. Efficiency: Speed (Normalized)
-    2. Safety: FDPF Intensity (Penalty)
-    
-    Formula:
-    R = (Speed / Target_Speed) - lambda * tanh(FDPF)
+    1. Efficiency: Speed / Target_Speed → [0, 1]
+    2. Safety: -0.5 * tanh(FDPF) → [-0.5, 0]
+    3. Collision: -2.0 (terminal penalty)
     """
     
-    # 1. Efficiency: Just linear speed reward up to target.
-    # We want it to be fast, but not crazy fast.
-    speed_kmh = env.vehicle.get_speed()
-    target_speed_val = 25.0 # From config or use variable
+    # Hyperparameters (use config values for consistency)
+    COLLISION_PENALTY = -2.0     # Collision penalty: clearly worse than normal worst case
+    SAFETY_WEIGHT = 0.5          # FDPF weight: reduced to avoid overly conservative behavior
     
-    # Normalized speed [0, 1] approximately
-    r_speed = min(speed_kmh / target_speed_val, 1.0)
-    
-    # 2. Safety: FDPF (includes lane boundaries and obstacles)
-    # The FDPF intensity grows exponentially near obstacles/boundaries.
-    # tanh wraps it to [0, 1] range for stability.
-    fdpf_intensity = getattr(env, 'fdpf_intensity', 0.0)
-    r_safety = -1.0 * np.tanh(fdpf_intensity)
-    
-    # 3. Hard Constraints (Optional but recommended for RL stability)
-    # If collision, immediate heavy penalty.
+    # 1. Collision Check (Hard Constraint)
     if env.collision_state:
-        return -1.0
-        
-    # Total
-    # Weights: Speed (1.0) + Safety (1.0). 
-    # The Meta-Learner will balance them based on value estimation.
+        return COLLISION_PENALTY
+    
+    # 2. Efficiency: Linear speed reward up to target
+    speed_kmh = env.vehicle.get_speed()
+    r_speed = min(speed_kmh / target_speed, 1.0)  # [0, 1], uses config target_speed
+    
+    # 3. Safety: FDPF-based risk penalty
+    # FDPF intensity grows near obstacles/boundaries
+    # tanh wraps to [0, 1), weight scales to [-0.5, 0]
+    fdpf_intensity = getattr(env, 'fdpf_intensity', 0.0)
+    r_safety = -SAFETY_WEIGHT * np.tanh(fdpf_intensity)  # [-0.5, 0]
+    
+    # 4. Total Reward
+    # Range: [-0.5, 1.0] for normal operation
     total_reward = r_speed + r_safety
     
-    return np.clip(total_reward, -1, 1)
+    return total_reward
 
 reward_functions["reward_fn_minimal_fdpf"] = create_reward_fn(reward_fn_minimal_fdpf)
 

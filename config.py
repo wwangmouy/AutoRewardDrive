@@ -211,7 +211,7 @@ _CONFIG_3 = {
     "gamma": 0.98,  # Discount factor for AutoReward
     "state": states["5"],
     "action_smoothing": 0.75,
-    "reward_fn": "reward_fn5", # Initial reward fn, will be overridden by AutoReward
+    "reward_fn": "reward_fn_minimal_fdpf",  # FDPF-based Ground Truth reward
     "reward_params": reward_params["reward_fn_5_default"],
     "eval_reward_params": reward_params["reward_eval"],
     "obs_res": (80, 120),

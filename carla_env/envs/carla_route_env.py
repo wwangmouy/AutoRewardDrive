@@ -124,7 +124,7 @@ class CarlaRouteEnv(gym.Env):
 
         self.carla_process = None
         if start_carla:
-            CARLA_ROOT = "/home/wy/CARLA_0.9.13"
+            CARLA_ROOT = "/home/ubuntu/wy/CARLA_0.9.13"
             carla_path = os.path.join(CARLA_ROOT, "CarlaUE4.sh")
             launch_command = [carla_path]
             launch_command += ['-quality_level=Low']
@@ -154,10 +154,11 @@ class CarlaRouteEnv(gym.Env):
 
         self.num_envs = 1
 
-        # Initialize FDPF
+        # Initialize FDPF (Force-based Dynamic Potential Field)
+        # Lane width is set dynamically from CARLA waypoint in step()
+        # Town02 has variable lane widths - typically 3.0-4.0m
         self.fdpf = FDPF()
-        self.fdpf.vehicle_width = 2.0 # Approx width
-        self.fdpf.lane_width = 3.5 # Approx lane width
+        self.fdpf.lane_width = 3.5  # Default fallback, updated dynamically per step
 
         # Setup gym environment
         self.action_space_type = action_space_type
@@ -416,9 +417,10 @@ class CarlaRouteEnv(gym.Env):
                              linewidth=2, edgecolor='black', facecolor='lime', alpha=0.8)
         ax.add_patch(ego_rect)
         
-        # Draw lane markings
-        ax.axvline(x=-3.5, color='white', linestyle='-', linewidth=2, alpha=0.8)
-        ax.axvline(x=3.5, color='white', linestyle='-', linewidth=2, alpha=0.8)
+        # Draw lane markings using dynamic lane width
+        lane_w = self.fdpf.lane_width if self.fdpf.lane_width > 0 else 3.5
+        ax.axvline(x=-lane_w/2, color='white', linestyle='-', linewidth=2, alpha=0.8)
+        ax.axvline(x=lane_w/2, color='white', linestyle='-', linewidth=2, alpha=0.8)
         ax.axvline(x=0, color='yellow', linestyle='--', linewidth=1, alpha=0.6)
         
         # Labels and formatting
@@ -672,13 +674,14 @@ class CarlaRouteEnv(gym.Env):
             wp_fwd = wp_trans.get_forward_vector()
             wp_right = wp_trans.get_right_vector()
             
+            # vector() returns numpy array [x, y, z], so use indexing
             vec = vector(actor_loc - wp_loc)
             
-            # Longitudinal projection on WP heading
-            s_proj = vec.x * wp_fwd.x + vec.y * wp_fwd.y + vec.z * wp_fwd.z
+            # Longitudinal projection on WP heading (dot product)
+            s_proj = vec[0] * wp_fwd.x + vec[1] * wp_fwd.y + vec[2] * wp_fwd.z
             
             # Lateral projection
-            l_proj = vec.x * wp_right.x + vec.y * wp_right.y + vec.z * wp_right.z
+            l_proj = vec[0] * wp_right.x + vec[1] * wp_right.y + vec[2] * wp_right.z
             # l_proj is positive to the right in UE4/Carla (Right Vector), but FDPF might expect Left.
             # FDPF logic: relative_direction = atan2(l, s). 
             # If l is positive left, and we use standard math, it's fine.
@@ -760,7 +763,11 @@ class CarlaRouteEnv(gym.Env):
             l_rel = l_val - ego_l_fdpf
             
             # Oncoming vehicle detection (Town02 dual-lane)
-            is_oncoming = (l_rel < -1.75) and (abs(delta_yaw) > np.pi / 2)
+            # Use dynamic half-lane width instead of hardcoded 1.75
+            current_lane_w = self.fdpf.lane_width if self.fdpf.lane_width > 0 else 3.5
+            half_lane_threshold = current_lane_w * 0.5
+            
+            is_oncoming = (l_rel < -half_lane_threshold) and (abs(delta_yaw) > np.pi / 2)
             effective_speed = v_scalar * 2.0 if is_oncoming else v_scalar
             
             s_idx = -1
@@ -769,9 +776,9 @@ class CarlaRouteEnv(gym.Env):
             elif s_rel < -10: s_idx = 0
             
             l_idx = -1
-            if l_rel > 1.75: l_idx = 0 # Left
-            elif l_rel < -1.75: l_idx = 2 # Right
-            else: l_idx = 1 # Center
+            if l_rel > half_lane_threshold: l_idx = 0  # Left (other lane or off-road)
+            elif l_rel < -half_lane_threshold: l_idx = 2  # Right (oncoming lane)
+            else: l_idx = 1  # Center (ego lane)
             
             if s_idx != -1 and l_idx != -1:
                  neighborhood_grids[s_idx][l_idx].append((s_val, l_val, delta_yaw, effective_speed))
