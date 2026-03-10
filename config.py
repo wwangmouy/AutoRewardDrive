@@ -206,6 +206,10 @@ reward_params = {
     ),
     "reward_progress_simple": dict(
         early_stop=True,
+        max_speed=35.0,
+        max_distance=3.0,
+        max_std_center_lane=0.4,
+        max_angle_center_lane=90.0,
         penalty_reward=-10.0,
         success_reward=5.0,
         progress_reward_scale=20.0,
