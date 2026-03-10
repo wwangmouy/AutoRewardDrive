@@ -9,6 +9,7 @@ from pygame.locals import *
 import random
 
 from config import CONFIG
+from carla_env.rewards import compute_ground_truth_reward
 
 from carla_env.tools.hud import HUD
 from carla_env.navigation.planner import RoadOption, compute_route_waypoints
@@ -103,6 +104,7 @@ class CarlaRouteEnv(gym.Env):
     def __init__(self, host="127.0.0.1", port=2000,
                  viewer_res=(1120, 560), obs_res=(80, 120),
                  reward_fn=None,
+                 eval_reward_params=None,
                  observation_space=None,
                  encode_state_fn=None,
                  fps=15, action_smoothing=0.0,
@@ -160,6 +162,7 @@ class CarlaRouteEnv(gym.Env):
 
         self.encode_state_fn = (lambda x: x) if not callable(encode_state_fn) else encode_state_fn
         self.reward_fn = (lambda x: 0) if not callable(reward_fn) else reward_fn
+        self.eval_reward_params = eval_reward_params
         self.max_distance = 3000  # m
         self.activate_spectator = activate_spectator
         self.activate_bev = activate_bev
@@ -513,6 +516,7 @@ class CarlaRouteEnv(gym.Env):
         self.distance_from_center_history.append(self.distance_from_center)
 
         self.last_reward = self.reward_fn(self)
+        self.ground_truth_reward = compute_ground_truth_reward(self, self.eval_reward_params)
         self.total_reward += self.last_reward
 
         encoded_state = self.encode_state_fn(self)
@@ -558,6 +562,7 @@ class CarlaRouteEnv(gym.Env):
             'avg_speed': (self.speed_accum / self.step_count),
             'mean_reward': (self.total_reward / self.step_count),
             'render_array': self.bev_data,
+            "ground_truth_reward": self.ground_truth_reward,
             "centering_factor": centering_factor,
             "angle_factor": angle_factor,
             "distance_std_factor": distance_std_factor,
@@ -844,4 +849,3 @@ class CarlaRouteEnv(gym.Env):
 
 if __name__ == "__main__":
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-

@@ -174,6 +174,7 @@ reward_params = {
         early_stop=True,
         target_speed=25.0,
         penalty_collision=-10.0,
+        penalty_failure=-10.0,
         reward_success=100.0,
         reward_time=-0.1,
     )
@@ -221,9 +222,14 @@ _CONFIG_3 = {
     "use_seg_bev": True,
     "use_rgb_bev": False,
     # AutoReward specific parameters
-    "reward_update_freq": 2048,  # Frequency of meta-learning updates
-    "n_samples": 1000,  # Number of action samples for reward baseline estimation
-    "reward_buffer_size": 100,  # Max number of trajectories in meta-learning buffer
+    "reward_update_freq": 1024,  # Frequency of meta-learning updates
+    "n_samples": 128,  # Number of action samples for reward baseline estimation
+    "reward_buffer_size": 64,  # Max number of trajectories in meta-learning buffer
+    "reward_state_keys": ["vehicle_measures", "waypoints"],
+    "reward_output_scale": 1.0,
+    "reward_lr": 1e-4,
+    "value_lr": 3e-4,
+    "reward_transition_updates": 5,
 }
 
 CONFIGS = {
@@ -239,4 +245,3 @@ def set_config(config_name):
     global CONFIG
     CONFIG = Box(CONFIGS[config_name], default_box=True)
     return CONFIG
-

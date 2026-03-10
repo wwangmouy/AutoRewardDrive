@@ -118,19 +118,9 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
         learned_reward = None
         if has_auto_reward:
             with torch.no_grad():
-                # Prepare full observation dict for features extractor
-                obs_dict = {}
-                obs_dict['seg_camera'] = torch.as_tensor(state['seg_camera']).to(model.device).float().permute(2, 0, 1).unsqueeze(0)
-                obs_dict['vehicle_measures'] = torch.as_tensor(state['vehicle_measures']).to(model.device).float().unsqueeze(0)
-                obs_dict['waypoints'] = torch.as_tensor(state['waypoints']).to(model.device).float().unsqueeze(0)
-                
-                # Extract features using the actor's feature extractor
-                features = model.actor.extract_features(
-                    obs_dict,
-                    model.actor.features_extractor
-                )
+                reward_state = model._extract_reward_state(state)
                 action_tensor = torch.as_tensor(action).to(model.device).float().unsqueeze(0)
-                r_omega = model.auto_reward_learner.get_reward(features, action_tensor)
+                r_omega = model.auto_reward_learner.get_reward(reward_state, action_tensor)
                 learned_reward = float(r_omega.cpu().numpy().flatten()[0])
         
         
@@ -198,6 +188,7 @@ if __name__ == "__main__":
 
     env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
                         reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
+                        eval_reward_params=CONFIG.get("eval_reward_params"),
                         encode_state_fn=encode_state_fn, fps=args["fps"], action_smoothing=CONFIG.action_smoothing,
                         eval=True, action_space_type=action_space_type, activate_spectator=True, activate_render=True,
                         activate_bev=True, activate_seg_bev=CONFIG.use_seg_bev, start_carla=True,

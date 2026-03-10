@@ -51,7 +51,10 @@ class AutoRewardedSAC(SAC):
         # Set before super().__init__() since it calls _setup_model()
         self.config = config
         self.reward_update_freq = config.get('reward_update_freq', 2048)
+        self.reward_transition_updates = config.get('reward_transition_updates', 5)
         self.auto_reward_learner = None
+        self.reward_state_keys = []
+        self.last_reward_mix_alpha = 0.0
         
         super().__init__(
             policy, env, learning_rate, buffer_size, learning_starts, batch_size,
@@ -64,15 +67,7 @@ class AutoRewardedSAC(SAC):
 
     def _setup_model(self) -> None:
         super()._setup_model()
-        
-        # Get state_dim from features extractor
-        if hasattr(self.actor, "features_extractor") and hasattr(self.actor.features_extractor, "_features_dim"):
-            state_dim = self.actor.features_extractor._features_dim
-        elif hasattr(self.actor, "features_extractor") and hasattr(self.actor.features_extractor, "features_dim"):
-            state_dim = self.actor.features_extractor.features_dim
-        else:
-            from stable_baselines3.common.preprocessing import get_flattened_obs_dim
-            state_dim = get_flattened_obs_dim(self.observation_space)
+        state_dim = self._get_reward_state_dim()
 
         action_dim = self.action_space.shape[0]
         
@@ -82,7 +77,61 @@ class AutoRewardedSAC(SAC):
             device=self.device,
             config=self.config
         )
-        print(f"[AutoRewardedSAC] Initialized: state_dim={state_dim}, action_dim={action_dim}")
+        print(f"[AutoRewardedSAC] Initialized: reward_state_dim={state_dim}, action_dim={action_dim}, reward_keys={self.reward_state_keys}")
+
+    def _get_reward_state_dim(self) -> int:
+        if not hasattr(self.observation_space, "spaces"):
+            raise ValueError("AutoRewardedSAC expects a dict observation space for reward learning.")
+
+        configured_keys = list(self.config.get("reward_state_keys", []))
+        available_keys = list(self.observation_space.spaces.keys())
+        reward_keys = [key for key in configured_keys if key in available_keys]
+        if not reward_keys:
+            reward_keys = []
+            for key, space in self.observation_space.spaces.items():
+                if len(space.shape) <= 2:
+                    reward_keys.append(key)
+
+        if not reward_keys:
+            raise ValueError("No stable non-image observation keys available for reward learning.")
+
+        state_dim = 0
+        for key in reward_keys:
+            state_dim += int(np.prod(self.observation_space.spaces[key].shape))
+
+        self.reward_state_keys = reward_keys
+        return state_dim
+
+    def _extract_reward_state(self, obs: Union[Dict[str, Any], np.ndarray]) -> torch.Tensor:
+        if not isinstance(obs, dict):
+            return torch.as_tensor(obs, device=self.device).float()
+
+        parts = []
+        for key in self.reward_state_keys:
+            value = torch.as_tensor(obs[key], device=self.device).float()
+            expected_ndim = len(self.observation_space.spaces[key].shape)
+            if value.ndim == expected_ndim:
+                value = value.unsqueeze(0)
+            parts.append(value.flatten(start_dim=1))
+
+        return torch.cat(parts, dim=1)
+
+    def _mix_policy_reward(self, env_rewards: np.ndarray, learned_rewards: np.ndarray) -> np.ndarray:
+        meta_updates = 0 if self.auto_reward_learner is None else self.auto_reward_learner.num_meta_updates
+        alpha = min(1.0, meta_updates / max(1, self.reward_transition_updates))
+        self.last_reward_mix_alpha = alpha
+        return ((1.0 - alpha) * env_rewards) + (alpha * learned_rewards)
+
+    def _get_torch_save_params(self):
+        state_dicts, tensors = super()._get_torch_save_params()
+        state_dicts = list(state_dicts)
+        state_dicts.extend([
+            "auto_reward_learner.reward_net",
+            "auto_reward_learner.reward_optimizer",
+            "auto_reward_learner.value_net",
+            "auto_reward_learner.value_optimizer",
+        ])
+        return state_dicts, tensors
 
     @classmethod
     def load(
@@ -142,7 +191,7 @@ class AutoRewardedSAC(SAC):
         model._setup_model()
         
         # Load the neural network parameters
-        model.set_parameters(params, exact_match=True, device=device)
+        model.set_parameters(params, exact_match=False, device=device)
         
         # Restore pytorch-specific variables
         model.__dict__.update(pytorch_variables)
@@ -183,29 +232,31 @@ class AutoRewardedSAC(SAC):
 
             with torch.no_grad():
                 obs_tensor, _ = self.policy.obs_to_tensor(self._last_obs)
-                features = self.actor.extract_features(obs_tensor, self.actor.features_extractor)
                 mean_actions, log_std, _ = self.actor.get_action_dist_params(obs_tensor)
-                # Use non_blocking to reduce sync overhead
-                mu = (mean_actions.detach(), log_std.detach())  # Keep on GPU, transfer later
+                reward_state = self._extract_reward_state(self._last_obs)
+                mu = (mean_actions.detach(), log_std.detach())
                 actions, log_probs = self.actor.action_log_prob(obs_tensor)
                 actions_np = actions.cpu(memory_format=torch.contiguous_format).numpy()
                 log_probs_np = log_probs.cpu(memory_format=torch.contiguous_format).numpy()
                 
-                # Compute learned reward R_omega inline (avoid redundant tensor conversion)
-                r_omega = self.auto_reward_learner.get_reward(features, actions)
+                r_omega = self.auto_reward_learner.get_reward(reward_state, actions)
                 r_omega_val = r_omega.cpu(memory_format=torch.contiguous_format).numpy().flatten()
                 
-                # Cache features on CPU (single transfer)
-                features_cpu = features.cpu(memory_format=torch.contiguous_format).numpy().flatten()
+                reward_state_cpu = reward_state[0].cpu(memory_format=torch.contiguous_format).numpy()
                 mu_cpu = (mu[0][0].cpu(), mu[1][0].cpu())
 
             new_obs, rewards, dones, infos = env.step(actions_np)
+            env_rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
+            ground_truth_rewards = np.asarray(
+                [info.get("ground_truth_reward", reward) for info, reward in zip(infos, env_rewards)],
+                dtype=np.float32,
+            )
+            policy_rewards = self._mix_policy_reward(env_rewards, r_omega_val)
             
-            # Store for meta-learning (ground truth reward)
             self.auto_reward_learner.store_transition(
-                state=features_cpu,
+                state=reward_state_cpu,
                 action=actions_np.flatten(),
-                reward=rewards[0],
+                reward=ground_truth_rewards[0],
                 log_prob=log_probs_np.flatten()[0],
                 mu=mu_cpu
             )
@@ -224,7 +275,7 @@ class AutoRewardedSAC(SAC):
                         real_next_obs[idx] = infos[idx]["terminal_observation"]
             
             # Store with learned reward
-            self.replay_buffer.add(self._last_obs, real_next_obs, actions_np, r_omega_val, dones, infos)
+            self.replay_buffer.add(self._last_obs, real_next_obs, actions_np, policy_rewards, dones, infos)
             self._last_obs = new_obs
             
             # Update callback locals for TensorboardCallback
@@ -273,3 +324,8 @@ class AutoRewardedSAC(SAC):
                 self.logger.record("autoreward/value_loss", metrics.get("value_loss", 0.0))
                 self.logger.record("autoreward/mean_R", metrics.get("mean_R_omega", 0.0))
                 self.logger.record("autoreward/mean_Adv", metrics.get("mean_Advantage", 0.0))
+                self.logger.record("autoreward/std_Adv", metrics.get("std_Advantage", 0.0))
+                self.logger.record("autoreward/mean_gt_reward", metrics.get("mean_gt_reward", 0.0))
+                self.logger.record("autoreward/reward_std", metrics.get("reward_std", 0.0))
+                self.logger.record("autoreward/meta_updates", metrics.get("meta_updates", 0))
+                self.logger.record("autoreward/reward_mix_alpha", self.last_reward_mix_alpha)

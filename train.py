@@ -49,6 +49,7 @@ action_space_type = 'continuous' if CONFIG.action_space_type != 'discrete' else 
 
 env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
                     reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
+                    eval_reward_params=CONFIG.get("eval_reward_params"),
                     encode_state_fn=encode_state_fn, fps=args["fps"],
                     action_smoothing=CONFIG.action_smoothing, action_space_type=action_space_type,
                     activate_spectator=args["no_render"], activate_render=args["no_render"],

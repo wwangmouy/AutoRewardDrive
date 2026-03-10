@@ -84,11 +84,12 @@ class RewardNetwork(nn.Module):
     Architecture: StateEncoder + ActionEncoder --> ForwardModel --> scalar reward
     """
     def __init__(self, state_dim, action_dim, hidden_dim, encode_dim, 
-                 activation_function=F.relu, last_activation=None):
+                 activation_function=F.relu, last_activation=torch.tanh, output_scale=1.0):
         super(RewardNetwork, self).__init__()
         self.state_encoder = StateEncoder(state_dim, hidden_dim, encode_dim, activation_function)
         self.action_encoder = ActionEncoder(action_dim, hidden_dim, encode_dim, activation_function)
         self.forward_model = ForwardModel(encode_dim, output_dim=1, last_activation=last_activation)
+        self.output_scale = output_scale
 
     def forward(self, state, action):
         """
@@ -101,7 +102,7 @@ class RewardNetwork(nn.Module):
         state_embedding = self.state_encoder(state)
         action_embedding = self.action_encoder(action)
         reward = self.forward_model(state_embedding, action_embedding)
-        return reward
+        return reward * self.output_scale
 
 
 # ======================================================
