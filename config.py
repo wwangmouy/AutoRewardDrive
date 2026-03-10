@@ -191,6 +191,25 @@ reward_params = {
         max_angle_center_lane=90,
         penalty_reward=-10,
     ),
+    "reward_safe_simple": dict(
+        early_stop=True,
+        min_speed=10.0,
+        max_speed=35.0,
+        target_speed=20.0,
+        max_distance=2.5,
+        max_std_center_lane=0.35,
+        max_angle_center_lane=60.0,
+        penalty_reward=-10.0,
+        progress_reward_scale=20.0,
+        steer_penalty_scale=0.05,
+        success_reward=5.0,
+    ),
+    "reward_progress_simple": dict(
+        early_stop=True,
+        penalty_reward=-10.0,
+        success_reward=5.0,
+        progress_reward_scale=20.0,
+    ),
     # Evaluation reward config (Ground Truth)
     "reward_eval": dict(
         early_stop=True,
@@ -250,8 +269,8 @@ _CONFIG_3 = {
     "low_speed_threshold_kmh": 1.0,
     "low_speed_timeout_sec": 20.0,
     "low_speed_grace_sec": 5.0,
-    "reward_fn": "reward_fn_Chen", # Initial reward fn, will be overridden by AutoReward
-    "reward_params": reward_params["reward_fn_5_default"],
+    "reward_fn": "reward_fn_progress_simple",
+    "reward_params": reward_params["reward_progress_simple"],
     "eval_reward_params": reward_params["reward_eval"],
     "obs_res": (80, 120),
     "seed": 100,
@@ -267,7 +286,10 @@ _CONFIG_3 = {
     "reward_output_scale": 1.0,
     "reward_lr": 1e-4,
     "value_lr": 3e-4,
-    "reward_transition_updates": 5,
+    "reward_mix_beta": 0.2,
+    "reward_mix_start_meta_updates": 20,
+    "reward_mix_full_meta_updates": 120,
+    "learned_reward_stats_momentum": 0.01,
 }
 
 CONFIGS = {

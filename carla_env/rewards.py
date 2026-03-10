@@ -361,6 +361,73 @@ def reward_fn5(env):
 reward_functions["reward_fn5"] = create_reward_fn(reward_fn5)
 
 
+def reward_fn_safe_simple(env):
+    """
+    Simple safety-oriented shaping reward.
+    It keeps the baseline lane-centering structure while adding explicit route progress.
+    """
+    min_speed = float(_reward_param(env, "min_speed", 10.0))
+    max_speed = float(_reward_param(env, "max_speed", 35.0))
+    target_speed = float(_reward_param(env, "target_speed", 20.0))
+    max_distance = float(_reward_param(env, "max_distance", 2.5))
+    max_std_center_lane = float(_reward_param(env, "max_std_center_lane", 0.35))
+    max_angle_center_lane = float(_reward_param(env, "max_angle_center_lane", 60.0))
+    penalty_reward = float(_reward_param(env, "penalty_reward", -10.0))
+    progress_reward_scale = float(_reward_param(env, "progress_reward_scale", 20.0))
+    steer_penalty_scale = float(_reward_param(env, "steer_penalty_scale", 0.05))
+    success_reward = float(_reward_param(env, "success_reward", 5.0))
+
+    if env.success_state:
+        return success_reward
+    if env.terminal_state:
+        return penalty_reward
+
+    angle = env.vehicle.get_angle(env.current_waypoint)
+    speed_kmh = env.vehicle.get_speed()
+    steer = abs(env.vehicle.get_control().steer)
+
+    if speed_kmh < min_speed:
+        speed_reward = speed_kmh / max(min_speed, 1e-6)
+    elif speed_kmh > target_speed:
+        speed_reward = 1.0 - (speed_kmh - target_speed) / max(max_speed - target_speed, 1e-6)
+    else:
+        speed_reward = 1.0
+    speed_reward = max(speed_reward, 0.0)
+
+    centering_factor = max(1.0 - env.distance_from_center / max_distance, 0.0)
+    angle_factor = max(1.0 - abs(angle / np.deg2rad(max_angle_center_lane)), 0.0)
+    std = np.std(env.distance_from_center_history)
+    distance_std_factor = max(1.0 - abs(std / max_std_center_lane), 0.0)
+
+    progress_bonus = progress_reward_scale * float(getattr(env, "progress_delta", 0.0))
+    smoothness_penalty = steer_penalty_scale * steer
+    lane_reward = speed_reward * centering_factor * angle_factor * distance_std_factor
+    return progress_bonus + lane_reward - smoothness_penalty
+
+
+reward_functions["reward_fn_safe_simple"] = create_reward_fn(reward_fn_safe_simple)
+
+
+def reward_fn_progress_simple(env):
+    """
+    Minimal route-following reward:
+    progress bonus + success bonus + failure penalty.
+    Safety is handled by environment termination, not by extra handcrafted terms here.
+    """
+    penalty_reward = float(_reward_param(env, "penalty_reward", -10.0))
+    success_reward = float(_reward_param(env, "success_reward", 5.0))
+    progress_reward_scale = float(_reward_param(env, "progress_reward_scale", 20.0))
+
+    if env.success_state:
+        return success_reward
+    if env.terminal_state:
+        return penalty_reward
+    return progress_reward_scale * float(getattr(env, "progress_delta", 0.0))
+
+
+reward_functions["reward_fn_progress_simple"] = create_reward_fn(reward_fn_progress_simple)
+
+
 def reward_fn_Chen(env):
     """
     A reward function that combines multiple factors:

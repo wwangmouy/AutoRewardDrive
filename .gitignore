@@ -4,3 +4,6 @@ __pycache__/
 *.pyo
 *.zip
 *.log
+*.csv
+events.*
+*.DS

@@ -51,11 +51,19 @@ class AutoRewardedSAC(SAC):
         # Set before super().__init__() since it calls _setup_model()
         self.config = config
         self.reward_update_freq = config.get('reward_update_freq', 2048)
-        self.reward_transition_updates = config.get('reward_transition_updates', 5)
         self.auto_reward_learner = None
         self.autoreward_num_meta_updates = 0
         self.reward_state_keys = []
         self.last_reward_mix_alpha = 0.0
+        self.reward_mix_beta = config.get('reward_mix_beta', 0.2)
+        self.reward_mix_start_meta_updates = config.get('reward_mix_start_meta_updates', 20)
+        self.reward_mix_full_meta_updates = config.get('reward_mix_full_meta_updates', 120)
+        self.learned_reward_running_mean = 0.0
+        self.learned_reward_running_sq_mean = 0.0
+        self.learned_reward_running_count = 0
+        self.learned_reward_stats_momentum = config.get('learned_reward_stats_momentum', 0.01)
+        self.last_raw_learned_reward_mean = 0.0
+        self.last_normalized_learned_reward_mean = 0.0
         
         super().__init__(
             policy, env, learning_rate, buffer_size, learning_starts, batch_size,
@@ -118,11 +126,50 @@ class AutoRewardedSAC(SAC):
 
         return torch.cat(parts, dim=1)
 
+    def _normalize_learned_reward(self, learned_rewards: np.ndarray) -> np.ndarray:
+        batch_mean = float(np.mean(learned_rewards))
+        batch_sq_mean = float(np.mean(np.square(learned_rewards)))
+        momentum = self.learned_reward_stats_momentum
+
+        if self.learned_reward_running_count == 0:
+            self.learned_reward_running_mean = batch_mean
+            self.learned_reward_running_sq_mean = batch_sq_mean
+        else:
+            self.learned_reward_running_mean = (
+                (1.0 - momentum) * self.learned_reward_running_mean + momentum * batch_mean
+            )
+            self.learned_reward_running_sq_mean = (
+                (1.0 - momentum) * self.learned_reward_running_sq_mean + momentum * batch_sq_mean
+            )
+
+        self.learned_reward_running_count += 1
+        variance = max(
+            self.learned_reward_running_sq_mean - (self.learned_reward_running_mean ** 2),
+            1e-6,
+        )
+        normalized = (learned_rewards - self.learned_reward_running_mean) / np.sqrt(variance)
+        normalized = np.clip(normalized, -5.0, 5.0)
+
+        self.last_raw_learned_reward_mean = batch_mean
+        self.last_normalized_learned_reward_mean = float(np.mean(normalized))
+        return normalized.astype(np.float32)
+
     def _mix_policy_reward(self, env_rewards: np.ndarray, learned_rewards: np.ndarray) -> np.ndarray:
         meta_updates = 0 if self.auto_reward_learner is None else self.auto_reward_learner.num_meta_updates
-        alpha = min(1.0, meta_updates / max(1, self.reward_transition_updates))
-        self.last_reward_mix_alpha = alpha
-        return ((1.0 - alpha) * env_rewards) + (alpha * learned_rewards)
+        if meta_updates < self.reward_mix_start_meta_updates:
+            alpha = 0.0
+        elif meta_updates >= self.reward_mix_full_meta_updates:
+            alpha = 1.0
+        else:
+            alpha = (
+                (meta_updates - self.reward_mix_start_meta_updates)
+                / max(1, self.reward_mix_full_meta_updates - self.reward_mix_start_meta_updates)
+            )
+
+        normalized_learned_rewards = self._normalize_learned_reward(learned_rewards)
+        residual_scale = self.reward_mix_beta * alpha
+        self.last_reward_mix_alpha = residual_scale
+        return env_rewards + residual_scale * normalized_learned_rewards
 
     def _get_torch_save_params(self):
         state_dicts, tensors = super()._get_torch_save_params()
@@ -328,12 +375,14 @@ class AutoRewardedSAC(SAC):
             
             if metrics:
                 self.autoreward_num_meta_updates = self.auto_reward_learner.num_meta_updates
-                self.logger.record("autoreward/meta_loss", metrics.get("meta_loss", 0.0))
                 self.logger.record("autoreward/value_loss", metrics.get("value_loss", 0.0))
-                self.logger.record("autoreward/mean_R", metrics.get("mean_R_omega", 0.0))
-                self.logger.record("autoreward/mean_Adv", metrics.get("mean_Advantage", 0.0))
-                self.logger.record("autoreward/std_Adv", metrics.get("std_Advantage", 0.0))
                 self.logger.record("autoreward/mean_gt_reward", metrics.get("mean_gt_reward", 0.0))
                 self.logger.record("autoreward/reward_std", metrics.get("reward_std", 0.0))
                 self.logger.record("autoreward/meta_updates", metrics.get("meta_updates", 0))
                 self.logger.record("autoreward/reward_mix_alpha", self.last_reward_mix_alpha)
+                self.logger.record("autoreward/raw_learned_reward_mean", self.last_raw_learned_reward_mean)
+                self.logger.record("autoreward/norm_learned_reward_mean", self.last_normalized_learned_reward_mean)
+                self.logger.record("autoreward/meta_loss", metrics.get("meta_loss", 0.0), exclude=("stdout",))
+                self.logger.record("autoreward/mean_R", metrics.get("mean_R_omega", 0.0), exclude=("stdout",))
+                self.logger.record("autoreward/mean_Adv", metrics.get("mean_Advantage", 0.0), exclude=("stdout",))
+                self.logger.record("autoreward/std_Adv", metrics.get("std_Advantage", 0.0), exclude=("stdout",))
