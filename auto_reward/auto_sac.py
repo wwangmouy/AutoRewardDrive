@@ -53,6 +53,7 @@ class AutoRewardedSAC(SAC):
         self.reward_update_freq = config.get('reward_update_freq', 2048)
         self.reward_transition_updates = config.get('reward_transition_updates', 5)
         self.auto_reward_learner = None
+        self.autoreward_num_meta_updates = 0
         self.reward_state_keys = []
         self.last_reward_mix_alpha = 0.0
         
@@ -77,6 +78,7 @@ class AutoRewardedSAC(SAC):
             device=self.device,
             config=self.config
         )
+        self.auto_reward_learner.num_meta_updates = getattr(self, "autoreward_num_meta_updates", 0)
         print(f"[AutoRewardedSAC] Initialized: reward_state_dim={state_dim}, action_dim={action_dim}, reward_keys={self.reward_state_keys}")
 
     def _get_reward_state_dim(self) -> int:
@@ -132,6 +134,11 @@ class AutoRewardedSAC(SAC):
             "auto_reward_learner.value_optimizer",
         ])
         return state_dicts, tensors
+
+    def _excluded_save_params(self):
+        excluded = list(super()._excluded_save_params())
+        excluded.extend(["auto_reward_learner"])
+        return excluded
 
     @classmethod
     def load(
@@ -268,10 +275,10 @@ class AutoRewardedSAC(SAC):
             real_next_obs = new_obs.copy()
             for idx, done in enumerate(dones):
                 if done:
+                    self.auto_reward_learner.on_episode_end()
+                    num_collected_episodes += 1
+                    self._episode_num += 1
                     if infos[idx].get("terminal_observation") is not None:
-                        self.auto_reward_learner.on_episode_end()
-                        num_collected_episodes += 1
-                        self._episode_num += 1
                         real_next_obs[idx] = infos[idx]["terminal_observation"]
             
             # Store with learned reward
@@ -320,6 +327,7 @@ class AutoRewardedSAC(SAC):
             metrics = self.auto_reward_learner.optimize_reward(sample_action_from_mu)
             
             if metrics:
+                self.autoreward_num_meta_updates = self.auto_reward_learner.num_meta_updates
                 self.logger.record("autoreward/meta_loss", metrics.get("meta_loss", 0.0))
                 self.logger.record("autoreward/value_loss", metrics.get("value_loss", 0.0))
                 self.logger.record("autoreward/mean_R", metrics.get("mean_R_omega", 0.0))

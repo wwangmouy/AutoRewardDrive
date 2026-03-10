@@ -79,8 +79,9 @@ class HParamCallback(BaseCallback):
         # define the metrics that will appear in the `HPARAMS` Tensorboard tab by referencing their tag
         # Tensorbaord will find & display metrics from the `SCALARS` tab
         metric_dict = {
-            "rollout/ep_len_mean": 0,
-            "train/value_loss": 0,
+            "episode/success": 0,
+            "episode/env_reward_sum": 0,
+            "episode/length": 0,
         }
         self.logger.record(
             "hparams",
@@ -99,75 +100,85 @@ class TensorboardCallback(BaseCallback):
 
     def __init__(self, verbose=0):
         super().__init__(verbose)
+        self._reset_episode_buffers()
+
+    def _reset_episode_buffers(self):
+        self.episode_policy_rewards = []
         self.episode_learned_rewards = []
         self.episode_ground_truth_rewards = []
 
-    def _on_step(self) -> bool:
-        # Track rewards per step for AutoReward comparison
-        if hasattr(self.model, 'auto_reward_learner'):
-            # Get the last stored ground truth reward from infos if available
-            if 'ground_truth_reward' in self.locals.get('infos', [{}])[0]:
-                self.episode_ground_truth_rewards.append(
-                    self.locals['infos'][0]['ground_truth_reward']
-                )
-            # Get learned reward from replay buffer (most recent)
-            if hasattr(self.model, 'replay_buffer') and self.model.replay_buffer.pos > 0:
-                last_learned_reward = self.model.replay_buffer.rewards[self.model.replay_buffer.pos - 1]
-                self.episode_learned_rewards.append(float(last_learned_reward))
+    @staticmethod
+    def _to_scalar(value):
+        if value is None:
+            return None
 
-        # Log scalar value (here a random variable)
+        array = np.asarray(value)
+        if array.size == 0:
+            return None
+
+        return float(array.reshape(-1)[0])
+
+    def _on_step(self) -> bool:
+        info = self.locals.get('infos', [{}])[0]
+
+        if hasattr(self.model, 'auto_reward_learner'):
+            policy_reward = self._to_scalar(self.locals.get('policy_rewards'))
+            learned_reward = self._to_scalar(self.locals.get('r_omega_val'))
+            ground_truth_reward = self._to_scalar(self.locals.get('ground_truth_rewards'))
+
+            if policy_reward is not None:
+                self.episode_policy_rewards.append(policy_reward)
+            if learned_reward is not None:
+                self.episode_learned_rewards.append(learned_reward)
+            if ground_truth_reward is None and 'ground_truth_reward' in info:
+                ground_truth_reward = self._to_scalar(info['ground_truth_reward'])
+            if ground_truth_reward is not None:
+                self.episode_ground_truth_rewards.append(ground_truth_reward)
+
         if self.locals['dones'][0]:
+            terminal_reason = info.get('terminal_reason', 'Unknown')
+
             self.logger.record("time/num_timesteps", self.num_timesteps)
-            self.logger.record("custom/total_reward", self.locals['infos'][0]['total_reward'])
-            self.logger.record("custom/routes_completed", self.locals['infos'][0]['routes_completed'])
-            self.logger.record("custom/total_distance", self.locals['infos'][0]['total_distance'])
-            self.logger.record("custom/avg_center_dev", self.locals['infos'][0]['avg_center_dev'])
-            self.logger.record("custom/avg_speed", self.locals['infos'][0]['avg_speed'])
-            self.logger.record("custom/mean_reward", self.locals['infos'][0]['mean_reward'])
-            self.logger.record("custom/collision_rate", self.locals['infos'][0]['collision_rate'])
-            self.logger.record("custom/collision_num", self.locals['infos'][0]['collision_num'])
-            self.logger.record("custom/episode_length", self.locals['infos'][0]['episode_length'])
-            if self.locals['infos'][0]['collision_state']:
-                self.logger.record("custom/CPS", self.locals['infos'][0]['CPS'])
-                self.logger.record("custom/CPM", self.locals['infos'][0]['CPM'])
-                self.logger.record("custom/collision_interval", self.locals['infos'][0]['collision_interval'])
-                self.logger.record("custom/collision_speed", self.locals['infos'][0]['collision_speed'])
+            self.logger.record("episode/env_reward_sum", info['total_reward'])
+            self.logger.record("episode/env_reward_mean", info['mean_reward'])
+            self.logger.record("episode/routes_completed", info['routes_completed'])
+            self.logger.record("episode/route_progress", info['route_progress'])
+            self.logger.record("episode/progress_delta_last", info['progress_delta'])
+            self.logger.record("episode/total_distance", info['total_distance'])
+            self.logger.record("episode/step_distance_last", info['step_distance'])
+            self.logger.record("episode/avg_center_dev", info['avg_center_dev'])
+            self.logger.record("episode/avg_speed", info['avg_speed'])
+            self.logger.record("episode/length", info['episode_length'])
+            self.logger.record("episode/success", float(info.get('success_state', False)))
+            self.logger.record("episode/collision", float(info['collision_state']))
+            self.logger.record("episode/stuck", float(terminal_reason == "Vehicle stuck"))
+            self.logger.record("episode/off_track", float(terminal_reason == "Off-track"))
+            self.logger.record("episode/too_fast", float(terminal_reason == "Too fast"))
+            self.logger.record("episode/closed", float(info['closed']))
+            self.logger.record("window/collision_rate", info['collision_rate'])
+
+            if info['collision_state']:
+                self.logger.record("collision/CPS", info['CPS'])
+                self.logger.record("collision/CPM", info['CPM'])
+                self.logger.record("collision/interval", info['collision_interval'])
+                self.logger.record("collision/speed", info['collision_speed'])
 
             # AutoReward specific metrics
             if hasattr(self.model, 'auto_reward_learner'):
                 learner = self.model.auto_reward_learner
-                # Trajectory buffer size
                 self.logger.record("autoreward/trajectory_buffer_size", len(learner.D_xi))
-                
-                # Episode-level reward comparison
+                if self.episode_policy_rewards:
+                    self.logger.record("autoreward/ep_policy_reward_sum", np.sum(self.episode_policy_rewards))
+                    self.logger.record("autoreward/ep_policy_reward_mean", np.mean(self.episode_policy_rewards))
                 if self.episode_learned_rewards:
-                    self.logger.record("autoreward/ep_mean_learned_reward", np.mean(self.episode_learned_rewards))
-                    self.logger.record("autoreward/ep_sum_learned_reward", np.sum(self.episode_learned_rewards))
+                    self.logger.record("autoreward/ep_learned_reward_sum", np.sum(self.episode_learned_rewards))
+                    self.logger.record("autoreward/ep_learned_reward_mean", np.mean(self.episode_learned_rewards))
                 if self.episode_ground_truth_rewards:
-                    self.logger.record("autoreward/ep_mean_gt_reward", np.mean(self.episode_ground_truth_rewards))
-                    self.logger.record("autoreward/ep_sum_gt_reward", np.sum(self.episode_ground_truth_rewards))
-                
-                # Reward correlation (if both available)
-                if len(self.episode_learned_rewards) > 1 and len(self.episode_ground_truth_rewards) > 1:
-                    if len(self.episode_learned_rewards) == len(self.episode_ground_truth_rewards):
-                        correlation = np.corrcoef(self.episode_learned_rewards, self.episode_ground_truth_rewards)[0, 1]
-                        if not np.isnan(correlation):
-                            self.logger.record("autoreward/reward_correlation", correlation)
-                
-                # Reset episode tracking
-                self.episode_learned_rewards = []
-                self.episode_ground_truth_rewards = []
+                    self.logger.record("autoreward/ep_ground_truth_reward_sum", np.sum(self.episode_ground_truth_rewards))
+                    self.logger.record("autoreward/ep_ground_truth_reward_mean", np.mean(self.episode_ground_truth_rewards))
 
             self.logger.dump(self.num_timesteps)
-
-            if hasattr(self.model, 'replay_buffer'):
-                recent_rewards = self.model.replay_buffer.rewards[max(0, self.model.replay_buffer.pos-500):self.model.replay_buffer.pos]
-                mean_recent_rewards = np.mean(recent_rewards)
-                sum_recent_rewards = np.sum(recent_rewards)
-
-                # Log the results
-                self.logger.record("replay_buffer/mean_recent_rewards", mean_recent_rewards)
-                self.logger.record("replay_buffer/sum_recent_rewards", sum_recent_rewards)
+            self._reset_episode_buffers()
 
         return True
 

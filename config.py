@@ -14,7 +14,8 @@ import torch
 class CustomCNN(nn.Module):
     def __init__(self, input_shape, features_dim=1):
         super(CustomCNN, self).__init__()
-        n_input_channels = input_shape[0]
+        self.channels_first, cnn_input_shape = self._canonicalize_image_shape(input_shape)
+        n_input_channels = cnn_input_shape[0]
 
         if n_input_channels == 3:
             self.cnn = nn.Sequential(
@@ -47,11 +48,31 @@ class CustomCNN(nn.Module):
                 nn.Flatten(),
             )
         with torch.no_grad():
-            n_flatten = self.cnn(torch.zeros(1, *input_shape)).view(-1).shape[0]
+            n_flatten = self.cnn(torch.zeros(1, *cnn_input_shape)).view(-1).shape[0]
 
         self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
 
+    @staticmethod
+    def _canonicalize_image_shape(input_shape):
+        if len(input_shape) != 3:
+            raise ValueError(f"CustomCNN expects a 3D image shape, got {input_shape}")
+
+        if input_shape[0] <= 8 and input_shape[1] > 8 and input_shape[2] > 8:
+            return True, input_shape
+
+        if input_shape[2] <= 8 and input_shape[0] > 8 and input_shape[1] > 8:
+            return False, (input_shape[2], input_shape[0], input_shape[1])
+
+        raise ValueError(f"Unable to infer channel position for image shape {input_shape}")
+
     def forward(self, x):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        if not self.channels_first:
+            x = x.permute(0, 3, 1, 2)
+        x = x.float()
+        if torch.amax(x) > 1.0:
+            x = x / 255.0
         x = self.cnn(x)
         x = self.linear(x)
         return x
@@ -62,10 +83,11 @@ class CustomMultiInputExtractor(BaseFeaturesExtractor):
         super(CustomMultiInputExtractor, self).__init__(observation_space, features_dim)
         extractors = {}
         total_concat_size = 0
+        image_keys = {"rgb_camera", "seg_camera"}
 
         if isinstance(observation_space, gym.spaces.Dict):
             for key, subspace in observation_space.spaces.items():
-                if key == "seg_camera":
+                if key in image_keys:
                     extractors[key] = CustomCNN(subspace.shape, features_dim=features_dim)
                     total_concat_size += features_dim
                 else:
@@ -173,10 +195,14 @@ reward_params = {
     "reward_eval": dict(
         early_stop=True,
         target_speed=25.0,
-        penalty_collision=-10.0,
+        reward_progress=20.0,
+        penalty_collision=-20.0,
+        penalty_offtrack=-12.0,
+        penalty_stuck=-8.0,
+        penalty_too_fast=-6.0,
         penalty_failure=-10.0,
         reward_success=100.0,
-        reward_time=-0.1,
+        reward_time=-0.05,
     )
 }
 
@@ -184,7 +210,11 @@ _CONFIG_1 = {
     "algorithm": "PPO",
     "algorithm_params": algorithm_params["PPO"],
     "state": states["5"],
+    "action_space_type": "continuous",
     "action_smoothing": 0.75,
+    "low_speed_threshold_kmh": 1.0,
+    "low_speed_timeout_sec": 20.0,
+    "low_speed_grace_sec": 5.0,
     "reward_fn": "reward_fn5",
     "reward_params": reward_params["reward_fn_5_default"],
     "obs_res": (80, 120),
@@ -197,7 +227,11 @@ _CONFIG_2 = {
     "algorithm": "SAC",
     "algorithm_params": algorithm_params["SAC"],
     "state": states["5"],
+    "action_space_type": "continuous",
     "action_smoothing": 0.75,
+    "low_speed_threshold_kmh": 1.0,
+    "low_speed_timeout_sec": 20.0,
+    "low_speed_grace_sec": 5.0,
     "reward_fn": "reward_fn5",
     "reward_params": reward_params["reward_fn_5_default"],
     "obs_res": (80, 120),
@@ -211,7 +245,11 @@ _CONFIG_3 = {
     "algorithm_params": algorithm_params["SAC_AUTO"],
     "gamma": 0.98,  # Discount factor for AutoReward
     "state": states["5"],
+    "action_space_type": "continuous",
     "action_smoothing": 0.75,
+    "low_speed_threshold_kmh": 1.0,
+    "low_speed_timeout_sec": 20.0,
+    "low_speed_grace_sec": 5.0,
     "reward_fn": "reward_fn_Chen", # Initial reward fn, will be overridden by AutoReward
     "reward_params": reward_params["reward_fn_5_default"],
     "eval_reward_params": reward_params["reward_eval"],

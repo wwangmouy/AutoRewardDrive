@@ -66,7 +66,7 @@ def create_encode_state_fn(measurements_to_include, CONFIG, vae=None):
         if measure_flags[1]: vehicle_measures.append(env.vehicle.control.throttle)
         if measure_flags[2]: vehicle_measures.append(env.vehicle.get_speed())
         if measure_flags[3]: vehicle_measures.append(env.vehicle.get_angle(env.current_waypoint))
-        encoded_state['vehicle_measures'] = vehicle_measures
+        encoded_state['vehicle_measures'] = np.asarray(vehicle_measures, dtype=np.float32)
         if measure_flags[4]: encoded_state['maneuver'] = env.current_road_maneuver.value
 
         if measure_flags[5]:
@@ -76,7 +76,7 @@ def create_encode_state_fn(measurements_to_include, CONFIG, vae=None):
             vehicle_location = vector(env.vehicle.get_location())
             theta = np.deg2rad(env.vehicle.get_transform().rotation.yaw)
 
-            relative_waypoints = np.zeros((15, 2))
+            relative_waypoints = np.zeros((15, 2), dtype=np.float32)
             for i, w_location in enumerate(waypoints):
                 relative_waypoints[i] = get_displacement_vector(vehicle_location, w_location, theta)[:2]
             if len(waypoints) < 15:
@@ -93,14 +93,23 @@ def create_encode_state_fn(measurements_to_include, CONFIG, vae=None):
             vehicle_location = vector(env.vehicle.get_location())
             theta = np.deg2rad(env.vehicle.get_transform().rotation.yaw)
             end_wp_location = vector(env.end_wp.transform.location)
-            encoded_state['end_wp_vector'] = get_displacement_vector(vehicle_location, end_wp_location, theta)[:2]
+            encoded_state['end_wp_vector'] = np.asarray(
+                get_displacement_vector(vehicle_location, end_wp_location, theta)[:2],
+                dtype=np.float32,
+            )
         if measure_flags[9]:
             vehicle_location = vector(env.start_wp.transform.location)
             theta = np.deg2rad(env.start_wp.transform.rotation.yaw)
             end_wp_location = vector(env.end_wp.transform.location)
-            encoded_state['end_wp_fixed'] = get_displacement_vector(vehicle_location, end_wp_location, theta)[:2]
+            encoded_state['end_wp_fixed'] = np.asarray(
+                get_displacement_vector(vehicle_location, end_wp_location, theta)[:2],
+                dtype=np.float32,
+            )
         if measure_flags[10]:
-            encoded_state['distance_goal'] = [[len(env.route_waypoints) - env.current_waypoint_index]]
+            encoded_state['distance_goal'] = np.asarray(
+                [[len(env.route_waypoints) - env.current_waypoint_index]],
+                dtype=np.float32,
+            )
 
         return encoded_state
 

@@ -13,12 +13,12 @@ parser.add_argument("--host", default="localhost", type=str, help="IP of the hos
 parser.add_argument("--port", default=2000, type=int, help="TCP port to listen to (default: 2000)")
 parser.add_argument("--total_timesteps", type=int, default=1_000_000, help="Total timestep to train for")
 parser.add_argument("--start_carla", action="store_true", help="If True, start a CARLA server")
-parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
+parser.add_argument("--no_render", action="store_false", help="Disable spectator/render output")
 parser.add_argument("--fps", type=int, default=15, help="FPS to render the environment")
 parser.add_argument("--num_checkpoints", type=int, default=100, help="Checkpoint number")
 parser.add_argument("--log_dir", type=str, default="tensorboard", help="Directory to save logs")
 parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
-parser.add_argument("--config", type=str, default="vlm_rl_ppo", help="Config to use (default: vlm_rl)")
+parser.add_argument("--config", type=str, default="3", help="Config id to use")
 
 args = vars(parser.parse_args())
 CONFIG = config.set_config(args["config"])
@@ -49,6 +49,7 @@ action_space_type = 'continuous' if CONFIG.action_space_type != 'discrete' else 
 
 env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
                     reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
+                    reward_params=CONFIG.reward_params,
                     eval_reward_params=CONFIG.get("eval_reward_params"),
                     encode_state_fn=encode_state_fn, fps=args["fps"],
                     action_smoothing=CONFIG.action_smoothing, action_space_type=action_space_type,

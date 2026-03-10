@@ -5,51 +5,26 @@ import numpy as np
 from config import CONFIG
 
 
-min_speed = CONFIG.reward_params.min_speed
-max_speed = CONFIG.reward_params.max_speed
-target_speed = CONFIG.reward_params.target_speed
-max_distance = CONFIG.reward_params.max_distance
-max_std_center_lane = CONFIG.reward_params.max_std_center_lane
-max_angle_center_lane = CONFIG.reward_params.max_angle_center_lane
-penalty_reward = CONFIG.reward_params.penalty_reward
-early_stop = CONFIG.reward_params.early_stop
 reward_functions = {}
+
+
+def _get_reward_params(env):
+    return getattr(env, "reward_params", CONFIG.reward_params)
+
+
+def _reward_param(env, key, default):
+    params = _get_reward_params(env)
+    return params.get(key, default)
 
 
 def create_reward_fn(reward_fn):
     def func(env):
-        terminal_reason = "Running..."
-        if early_stop:
-            speed = env.vehicle.get_speed()
-            if speed < 1.0:
-                env.low_speed_timer += 1
-            else:
-                env.low_speed_timer = 0.0  # Reset timer if speed goes above threshold
-
-            # Check if speed is low for 90 consecutive second (only during training)
-            if env.low_speed_timer >= 90 * env.fps and not env.eval:
-                env.terminal_state = True
-                terminal_reason = "Vehicle stopped"
-
-            # Stop if distance from center > max distance
-            if env.distance_from_center > max_distance and not env.eval:
-                env.terminal_state = True
-                terminal_reason = "Off-track"
-
-            # Stop if speed is too high
-            if max_speed > 0 and speed > max_speed and not env.eval:
-                env.terminal_state = True
-                terminal_reason = "Too fast"
-
+        terminal_reason = getattr(env, "terminal_reason", "Running...")
 
         # Calculate reward
-        reward = 0
-        if not env.terminal_state:
-            reward += reward_fn(env)
-        else:
-            env.low_speed_timer = 0.0
-            if reward_fn in {reward_fn5}:
-                reward += penalty_reward
+        reward = reward_fn(env)
+        if env.terminal_state:
+            terminal_reason = getattr(env, "terminal_reason", terminal_reason)
             print(f"{env.episode_idx}| Terminal: ", terminal_reason)
 
         if env.success_state:
@@ -73,14 +48,28 @@ def compute_ground_truth_reward(env, params):
         return 0.0
 
     reward = float(params.get("reward_time", 0.0))
+    reward += float(params.get("reward_progress", 0.0)) * float(getattr(env, "progress_delta", 0.0))
     penalty_collision = float(params.get("penalty_collision", -10.0))
     penalty_failure = float(params.get("penalty_failure", penalty_collision))
+    penalty_offtrack = float(params.get("penalty_offtrack", penalty_failure))
+    penalty_stuck = float(params.get("penalty_stuck", penalty_failure))
+    penalty_too_fast = float(params.get("penalty_too_fast", penalty_failure))
     reward_success = float(params.get("reward_success", 0.0))
 
     if env.success_state:
         reward += reward_success
     elif env.terminal_state:
-        reward += penalty_collision if env.collision_state else penalty_failure
+        terminal_reason = getattr(env, "terminal_reason", "")
+        if env.collision_state:
+            reward += penalty_collision
+        elif terminal_reason == "Off-track":
+            reward += penalty_offtrack
+        elif terminal_reason == "Vehicle stuck":
+            reward += penalty_stuck
+        elif terminal_reason == "Too fast":
+            reward += penalty_too_fast
+        else:
+            reward += penalty_failure
 
     return reward
 
@@ -334,6 +323,17 @@ def reward_fn5(env):
                * distance_std_factor (1 when std from center lane is low, 0 when not)
     """
 
+    min_speed = float(_reward_param(env, "min_speed", 20.0))
+    max_speed = float(_reward_param(env, "max_speed", 35.0))
+    target_speed = float(_reward_param(env, "target_speed", 25.0))
+    max_distance = float(_reward_param(env, "max_distance", 3.0))
+    max_std_center_lane = float(_reward_param(env, "max_std_center_lane", 0.4))
+    max_angle_center_lane = float(_reward_param(env, "max_angle_center_lane", 90.0))
+    penalty_reward = float(_reward_param(env, "penalty_reward", -10.0))
+
+    if env.terminal_state and not env.success_state:
+        return penalty_reward
+
     angle = env.vehicle.get_angle(env.current_waypoint)
     speed_kmh = env.vehicle.get_speed()
     if speed_kmh < min_speed:  # When speed is in [0, min_speed] range
@@ -419,7 +419,7 @@ def reward_fn_ASAP(env):
     collision = env.collision_state
 
     # Calculate progress reward (1 reward per 10 meters)
-    distance_traveled = env.distance_traveled  # Total distance traveled in meters
+    distance_traveled = getattr(env, "step_distance", 0.0)
     r_progress = distance_traveled / 10.0  # 1 reward per 10 meters
 
     # Calculate destination reward

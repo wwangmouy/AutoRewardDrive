@@ -9,10 +9,10 @@ parser = argparse.ArgumentParser(description="Eval a CARLA agent")
 parser.add_argument("--host", default="localhost", type=str, help="IP of the host server (default: 127.0.0.1)")
 parser.add_argument("--port", default=2020, type=int, help="TCP port to listen to (default: 2000)")
 parser.add_argument("--model", type=str, default="./model_400000_steps.zip", help="Path to a model evaluate")
-parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
+parser.add_argument("--no_render", action="store_false", help="Disable spectator/render output")
 parser.add_argument("--fps", type=int, default=15, help="FPS to render the environment")
-parser.add_argument("--no_record_video", action="store_false", help="If True, record video of the evaluation")
-parser.add_argument("--config", type=str, default="vlm_rl", help="Config to use (default: vlm_rl)")
+parser.add_argument("--no_record_video", action="store_false", help="Disable video recording")
+parser.add_argument("--config", type=str, default="3", help="Config id to use")
 parser.add_argument("--seed", type=int, default=101, help="random seed")
 parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
 parser.add_argument("--density", choices=['empty', 'regular', 'dense'], default="regular",
@@ -87,8 +87,6 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
         next_state, reward, dones, info = env.step(action)
 
         state = next_state
-        if env.step_count >= 150 and env.current_waypoint_index == 0:
-            dones = True
 
         # Save route at the beginning of the episode
         if not saved_route:
@@ -188,6 +186,7 @@ if __name__ == "__main__":
 
     env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
                         reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
+                        reward_params=CONFIG.reward_params,
                         eval_reward_params=CONFIG.get("eval_reward_params"),
                         encode_state_fn=encode_state_fn, fps=args["fps"], action_smoothing=CONFIG.action_smoothing,
                         eval=True, action_space_type=action_space_type, activate_spectator=True, activate_render=True,
