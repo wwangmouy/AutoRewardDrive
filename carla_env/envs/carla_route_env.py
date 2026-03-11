@@ -1,4 +1,5 @@
 import os
+import socket
 import subprocess
 import time
 import gym
@@ -96,6 +97,29 @@ def random_choice_from_blueprint(blueprint):
     return random.choice(all_elements)
 
 
+def wait_for_tcp_port(host, port, timeout=120.0, poll_interval=1.0, process=None):
+    deadline = time.time() + timeout
+    last_error = None
+
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"CARLA process exited early with code {process.returncode}")
+
+        try:
+            with socket.create_connection((host, port), timeout=2.0):
+                return True
+        except OSError as exc:
+            last_error = exc
+            time.sleep(poll_interval)
+
+    if last_error is not None:
+        raise RuntimeError(
+            f"Timed out after {timeout:.0f}s waiting for CARLA server on {host}:{port}: {last_error}"
+        )
+
+    raise RuntimeError(f"Timed out after {timeout:.0f}s waiting for CARLA server on {host}:{port}")
+
+
 class CarlaRouteEnv(gym.Env):
     metadata = {
         "render.modes": ["human", "rgb_array", "rgb_array_no_hud", "state_pixels"]
@@ -121,6 +145,8 @@ class CarlaRouteEnv(gym.Env):
                  town='Town02'):
 
         self.carla_process = None
+        startup_timeout = float(os.environ.get("CARLA_STARTUP_TIMEOUT", 120.0))
+        client_timeout = float(os.environ.get("CARLA_CLIENT_TIMEOUT", 120.0))
         if start_carla:
             CARLA_ROOT = "/home/ubuntu/wy/CARLA_0.9.13"
             carla_path = os.path.join(CARLA_ROOT, "CarlaUE4.sh")
@@ -134,9 +160,8 @@ class CarlaRouteEnv(gym.Env):
             print("Running command:")
             print(" ".join(launch_command))
             self.carla_process = subprocess.Popen(launch_command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            print("Waiting for CARLA to initialize\n")
-
-            time.sleep(5)
+            print(f"Waiting for CARLA to initialize on {host}:{port} (timeout: {startup_timeout:.0f}s)\n")
+            wait_for_tcp_port(host, port, timeout=startup_timeout, process=self.carla_process)
 
         width, height = viewer_res
         if obs_res is None:
@@ -205,7 +230,7 @@ class CarlaRouteEnv(gym.Env):
         self.world = None
         try:
             self.client = carla.Client(host, port)
-            self.client.set_timeout(30.0)  # Increased timeout for map loading
+            self.client.set_timeout(client_timeout)
             self.world = World(self.client, town=town)
 
             settings = self.world.get_settings()
