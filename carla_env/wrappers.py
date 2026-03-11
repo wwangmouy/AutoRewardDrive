@@ -416,7 +416,12 @@ class Vehicle(CarlaActorBase):
 
 class World():
     def __init__(self, client, town='Town02'):
-        self.world = client.load_world(town)
+        current_world = client.get_world()
+        current_town = current_world.get_map().name.split('/')[-1]
+        if current_town == town:
+            self.world = current_world
+        else:
+            self.world = client.load_world(town)
         self.map = self.get_map()
         self.actor_list = []
 

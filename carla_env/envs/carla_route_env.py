@@ -120,6 +120,40 @@ def wait_for_tcp_port(host, port, timeout=120.0, poll_interval=1.0, process=None
     raise RuntimeError(f"Timed out after {timeout:.0f}s waiting for CARLA server on {host}:{port}")
 
 
+def wait_for_carla_world(host, port, town, client_timeout=120.0, startup_timeout=180.0,
+                         poll_interval=5.0, process=None):
+    deadline = time.time() + startup_timeout
+    last_error = None
+    attempt = 0
+
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"CARLA process exited early with code {process.returncode}")
+
+        attempt += 1
+        try:
+            client = carla.Client(host, port)
+            client.set_timeout(client_timeout)
+            world = World(client, town=town)
+            return client, world
+        except RuntimeError as exc:
+            last_error = exc
+            remaining = max(0.0, deadline - time.time())
+            print(
+                f"CARLA RPC/world not ready yet (attempt {attempt}, remaining {remaining:.0f}s): {exc}"
+            )
+            time.sleep(min(poll_interval, max(0.5, remaining)))
+
+    if last_error is not None:
+        raise RuntimeError(
+            f"Timed out after {startup_timeout:.0f}s waiting for CARLA world {town} on {host}:{port}: {last_error}"
+        )
+
+    raise RuntimeError(
+        f"Timed out after {startup_timeout:.0f}s waiting for CARLA world {town} on {host}:{port}"
+    )
+
+
 class CarlaRouteEnv(gym.Env):
     metadata = {
         "render.modes": ["human", "rgb_array", "rgb_array_no_hud", "state_pixels"]
@@ -229,9 +263,14 @@ class CarlaRouteEnv(gym.Env):
 
         self.world = None
         try:
-            self.client = carla.Client(host, port)
-            self.client.set_timeout(client_timeout)
-            self.world = World(self.client, town=town)
+            self.client, self.world = wait_for_carla_world(
+                host,
+                port,
+                town,
+                client_timeout=client_timeout,
+                startup_timeout=startup_timeout,
+                process=self.carla_process,
+            )
 
             settings = self.world.get_settings()
             settings.fixed_delta_seconds = 1 / self.fps
