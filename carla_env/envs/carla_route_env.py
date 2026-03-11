@@ -565,7 +565,7 @@ class CarlaRouteEnv(gym.Env):
                 waypoint_index += 1
             else:
                 break
-        self.current_waypoint_index = waypoint_index
+        self.current_waypoint_index = min(waypoint_index, len(self.route_waypoints) - 1)
 
         if self.current_waypoint_index < len(self.route_waypoints) - 1:
             self.next_waypoint, self.next_road_maneuver = self.route_waypoints[
@@ -576,7 +576,7 @@ class CarlaRouteEnv(gym.Env):
 
         self.current_waypoint, self.current_road_maneuver = self.route_waypoints[
             self.current_waypoint_index % len(self.route_waypoints)]
-        current_route_progress = (self.current_waypoint_index + 1) / len(self.route_waypoints)
+        current_route_progress = min(1.0, (self.current_waypoint_index + 1) / len(self.route_waypoints))
         self.progress_delta = max(0.0, current_route_progress - self.route_progress)
         self.route_progress = current_route_progress
         self.routes_completed = self.num_routes_completed + self.route_progress
@@ -776,7 +776,7 @@ class CarlaRouteEnv(gym.Env):
             self.hud.notification("Collision with {}".format(get_actor_display_name(event.other_actor)))
 
     def _update_low_speed_termination(self, current_speed, progressed_this_step):
-        if self.terminal_state or self.success_state:
+        if self.terminal_state or self.success_state or self.eval:
             return
 
         speed_threshold = self.low_speed_threshold_kmh
