@@ -227,6 +227,8 @@ class CarlaRouteEnv(gym.Env):
         self.low_speed_threshold_kmh = float(CONFIG.get("low_speed_threshold_kmh", 1.0))
         self.low_speed_timeout_sec = float(CONFIG.get("low_speed_timeout_sec", 20.0))
         self.low_speed_grace_sec = float(CONFIG.get("low_speed_grace_sec", 5.0))
+        self.longitudinal_smoothing = float(CONFIG.get("longitudinal_smoothing", self.action_smoothing))
+        self.max_steer_delta = float(CONFIG.get("max_steer_delta", 1.0))
         self.max_distance = 3000  # m
         self.activate_spectator = activate_spectator
         self.activate_bev = activate_bev
@@ -368,8 +370,11 @@ class CarlaRouteEnv(gym.Env):
         self.low_speed_timer = 0.0
         self.last_progress_step = 0
         self.last_progress_waypoint_index = 0
+        self.last_steer_delta = 0.0
+        self.last_longitudinal_delta = 0.0
         self.collision = False
         self.action_list = []
+        self.longitudinal_action_list = []
         self.world.tick()
 
         time.sleep(0.2)
@@ -392,6 +397,8 @@ class CarlaRouteEnv(gym.Env):
         self.low_speed_timer = 0.0
         self.last_progress_step = 0
         self.last_progress_waypoint_index = self.current_waypoint_index
+        self.last_steer_delta = 0.0
+        self.last_longitudinal_delta = 0.0
         self.previous_location = self.vehicle.get_transform().location
         self.total_steps = max(0, self.total_steps - 1)
         time.sleep(0.2)
@@ -529,14 +536,26 @@ class CarlaRouteEnv(gym.Env):
             elif self.action_space_type == "discrete":
                 throttle, steer = discrete_actions[int(action)]
 
-            self.vehicle.control.steer = smooth_action(self.vehicle.control.steer, steer, self.action_smoothing)
-            if throttle >= 0:
-                self.vehicle.control.throttle = throttle
+            prev_steer = self.vehicle.control.steer
+            smoothed_steer = smooth_action(prev_steer, steer, self.action_smoothing)
+            steer_delta = np.clip(smoothed_steer - prev_steer, -self.max_steer_delta, self.max_steer_delta)
+            final_steer = float(np.clip(prev_steer + steer_delta, -1.0, 1.0))
+            self.vehicle.control.steer = final_steer
+            self.last_steer_delta = abs(final_steer - prev_steer)
+
+            prev_longitudinal = self.vehicle.control.throttle - self.vehicle.control.brake
+            smoothed_longitudinal = smooth_action(prev_longitudinal, throttle, self.longitudinal_smoothing)
+            final_longitudinal = float(np.clip(smoothed_longitudinal, -1.0, 1.0))
+            self.last_longitudinal_delta = abs(final_longitudinal - prev_longitudinal)
+
+            if final_longitudinal >= 0:
+                self.vehicle.control.throttle = final_longitudinal
                 self.vehicle.control.brake = 0
             else:
                 self.vehicle.control.throttle = 0
-                self.vehicle.control.brake = -throttle
+                self.vehicle.control.brake = -final_longitudinal
             self.action_list.append(self.vehicle.control.steer)
+            self.longitudinal_action_list.append(final_longitudinal)
         self.world.tick()
 
         if self.use_seg_bev:

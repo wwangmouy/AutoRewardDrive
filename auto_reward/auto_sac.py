@@ -1,12 +1,13 @@
 import torch
 import numpy as np
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 from stable_baselines3 import SAC
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, RolloutReturn
-from stable_baselines3.common.utils import should_collect_more_steps
+from stable_baselines3.common.utils import polyak_update, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 
 from auto_reward.learner import AutoRewardLearner
@@ -64,6 +65,13 @@ class AutoRewardedSAC(SAC):
         self.learned_reward_stats_momentum = config.get('learned_reward_stats_momentum', 0.01)
         self.last_raw_learned_reward_mean = 0.0
         self.last_normalized_learned_reward_mean = 0.0
+        self.action_smoothness_horizon = int(config.get('action_smoothness_horizon', 4))
+        self.steer_smoothness_coef = float(config.get('steer_smoothness_coef', 0.2))
+        self.longitudinal_smoothness_coef = float(config.get('longitudinal_smoothness_coef', 0.05))
+        self._recent_policy_observations = deque(maxlen=self.action_smoothness_horizon + 1)
+        self.last_action_smoothness_loss = 0.0
+        self.last_steer_smoothness_loss = 0.0
+        self.last_longitudinal_smoothness_loss = 0.0
         
         super().__init__(
             policy, env, learning_rate, buffer_size, learning_starts, batch_size,
@@ -153,6 +161,72 @@ class AutoRewardedSAC(SAC):
         self.last_raw_learned_reward_mean = batch_mean
         self.last_normalized_learned_reward_mean = float(np.mean(normalized))
         return normalized.astype(np.float32)
+
+    def _clone_observation(self, obs: Union[Dict[str, Any], np.ndarray]) -> Union[Dict[str, Any], np.ndarray]:
+        if isinstance(obs, dict):
+            return {key: np.array(value, copy=True) for key, value in obs.items()}
+        return np.array(obs, copy=True)
+
+    def _append_recent_observation(self, obs: Union[Dict[str, Any], np.ndarray]) -> None:
+        self._recent_policy_observations.append(self._clone_observation(obs))
+
+    def _stack_recent_observations(self) -> Optional[Union[Dict[str, np.ndarray], np.ndarray]]:
+        if len(self._recent_policy_observations) < 2:
+            return None
+
+        obs_sequence = list(self._recent_policy_observations)
+        if isinstance(obs_sequence[0], dict):
+            stacked_obs: Dict[str, np.ndarray] = {}
+            for key in obs_sequence[0].keys():
+                key_batches = []
+                expected_ndim = len(self.observation_space.spaces[key].shape)
+                for obs in obs_sequence:
+                    value = np.array(obs[key], copy=False)
+                    if value.ndim == expected_ndim:
+                        value = np.expand_dims(value, axis=0)
+                    key_batches.append(value)
+                stacked_obs[key] = np.concatenate(key_batches, axis=0)
+            return stacked_obs
+
+        return np.stack(obs_sequence, axis=0)
+
+    def _compute_action_smoothness_loss(self) -> torch.Tensor:
+        obs_batch = self._stack_recent_observations()
+        zero = torch.tensor(0.0, device=self.device)
+        if obs_batch is None:
+            self.last_action_smoothness_loss = 0.0
+            self.last_steer_smoothness_loss = 0.0
+            self.last_longitudinal_smoothness_loss = 0.0
+            return zero
+
+        obs_tensor, _ = self.policy.obs_to_tensor(obs_batch)
+        with torch.set_grad_enabled(True):
+            mean_actions, log_std, kwargs = self.actor.get_action_dist_params(obs_tensor)
+            deterministic_actions = self.actor.action_dist.actions_from_params(
+                mean_actions, log_std, deterministic=True, **kwargs
+            )
+
+        if deterministic_actions.shape[0] < 2:
+            self.last_action_smoothness_loss = 0.0
+            self.last_steer_smoothness_loss = 0.0
+            self.last_longitudinal_smoothness_loss = 0.0
+            return zero
+
+        deltas = deterministic_actions[1:] - deterministic_actions[:-1]
+        steer_loss = torch.mean(torch.square(deltas[:, 0]))
+        if deterministic_actions.shape[1] > 1:
+            longitudinal_loss = torch.mean(torch.square(deltas[:, 1]))
+        else:
+            longitudinal_loss = zero
+
+        smoothness_loss = (
+            self.steer_smoothness_coef * steer_loss
+            + self.longitudinal_smoothness_coef * longitudinal_loss
+        )
+        self.last_action_smoothness_loss = float(smoothness_loss.detach().cpu().item())
+        self.last_steer_smoothness_loss = float(steer_loss.detach().cpu().item())
+        self.last_longitudinal_smoothness_loss = float(longitudinal_loss.detach().cpu().item())
+        return smoothness_loss
 
     def _mix_policy_reward(self, env_rewards: np.ndarray, learned_rewards: np.ndarray) -> np.ndarray:
         meta_updates = 0 if self.auto_reward_learner is None else self.auto_reward_learner.num_meta_updates
@@ -283,6 +357,7 @@ class AutoRewardedSAC(SAC):
         while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
             if self.use_sde:
                 self.actor.reset_noise(env.num_envs)
+            self._append_recent_observation(self._last_obs)
 
             with torch.no_grad():
                 obs_tensor, _ = self.policy.obs_to_tensor(self._last_obs)
@@ -325,6 +400,7 @@ class AutoRewardedSAC(SAC):
                     self.auto_reward_learner.on_episode_end()
                     num_collected_episodes += 1
                     self._episode_num += 1
+                    self._recent_policy_observations.clear()
                     if infos[idx].get("terminal_observation") is not None:
                         real_next_obs[idx] = infos[idx]["terminal_observation"]
             
@@ -344,7 +420,88 @@ class AutoRewardedSAC(SAC):
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         """Train with periodic meta-gradient updates."""
-        super().train(gradient_steps, batch_size)
+        self.policy.set_training_mode(True)
+        optimizers = [self.actor.optimizer, self.critic.optimizer]
+        if self.ent_coef_optimizer is not None:
+            optimizers.append(self.ent_coef_optimizer)
+
+        self._update_learning_rate(optimizers)
+
+        ent_coef_losses, ent_coefs = [], []
+        actor_losses, critic_losses = [], []
+        action_smoothness_losses, steer_smoothness_losses, longitudinal_smoothness_losses = [], [], []
+
+        for gradient_step in range(gradient_steps):
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+
+            if self.use_sde:
+                self.actor.reset_noise()
+
+            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+            log_prob = log_prob.reshape(-1, 1)
+
+            ent_coef_loss = None
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                ent_coef = torch.exp(self.log_ent_coef.detach())
+                ent_coef_loss = -(
+                    self.log_ent_coef * (log_prob + self.target_entropy).detach()
+                ).mean()
+                ent_coef_losses.append(ent_coef_loss.item())
+            else:
+                ent_coef = self.ent_coef_tensor
+
+            ent_coefs.append(ent_coef.item())
+
+            if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+
+            with torch.no_grad():
+                next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
+                next_q_values = torch.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
+                next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+
+            current_q_values = self.critic(replay_data.observations, replay_data.actions)
+            critic_loss = 0.5 * sum(torch.nn.functional.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+            critic_losses.append(critic_loss.item())
+
+            self.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic.optimizer.step()
+
+            q_values_pi = torch.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+            min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
+            actor_base_loss = (ent_coef * log_prob - min_qf_pi).mean()
+            action_smoothness_loss = self._compute_action_smoothness_loss()
+            actor_loss = actor_base_loss + action_smoothness_loss
+            actor_losses.append(actor_loss.item())
+            action_smoothness_losses.append(self.last_action_smoothness_loss)
+            steer_smoothness_losses.append(self.last_steer_smoothness_loss)
+            longitudinal_smoothness_losses.append(self.last_longitudinal_smoothness_loss)
+
+            self.actor.optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor.optimizer.step()
+
+            if gradient_step % self.target_update_interval == 0:
+                polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
+                polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+
+        self._n_updates += gradient_steps
+
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/ent_coef", np.mean(ent_coefs))
+        self.logger.record("train/actor_loss", np.mean(actor_losses))
+        self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("train/action_smoothness_loss", np.mean(action_smoothness_losses))
+        self.logger.record("train/steer_smoothness_loss", np.mean(steer_smoothness_losses), exclude=("stdout",))
+        self.logger.record("train/longitudinal_smoothness_loss", np.mean(longitudinal_smoothness_losses), exclude=("stdout",))
+        if len(ent_coef_losses) > 0:
+            self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
         
         def sample_action_from_mu(mu_batch, n_samples):
             """Resample actions from policy distribution."""

@@ -269,7 +269,9 @@ _CONFIG_3 = {
     "gamma": 0.98,  # Discount factor for AutoReward
     "state": states["5"],
     "action_space_type": "continuous",
-    "action_smoothing": 0.75,
+    "action_smoothing": 0.85,
+    "longitudinal_smoothing": 0.9,
+    "max_steer_delta": 0.08,
     "low_speed_threshold_kmh": 1.0,
     "low_speed_timeout_sec": 20.0,
     "low_speed_grace_sec": 5.0,
@@ -290,10 +292,13 @@ _CONFIG_3 = {
     "reward_output_scale": 1.0,
     "reward_lr": 1e-4,
     "value_lr": 3e-4,
-    "reward_mix_beta": 0.2,
-    "reward_mix_start_meta_updates": 20,
-    "reward_mix_full_meta_updates": 120,
+    "reward_mix_beta": 0.1,
+    "reward_mix_start_meta_updates": 40,
+    "reward_mix_full_meta_updates": 200,
     "learned_reward_stats_momentum": 0.01,
+    "action_smoothness_horizon": 4,
+    "steer_smoothness_coef": 0.2,
+    "longitudinal_smoothness_coef": 0.05,
 }
 
 CONFIGS = {
