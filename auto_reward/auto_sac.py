@@ -59,6 +59,9 @@ class AutoRewardedSAC(SAC):
         self.reward_mix_beta = config.get('reward_mix_beta', 0.2)
         self.reward_mix_start_meta_updates = config.get('reward_mix_start_meta_updates', 20)
         self.reward_mix_full_meta_updates = config.get('reward_mix_full_meta_updates', 120)
+        self.max_meta_updates = config.get('max_meta_updates', None)
+        if self.max_meta_updates is not None:
+            self.max_meta_updates = int(self.max_meta_updates)
         self.learned_reward_running_mean = 0.0
         self.learned_reward_running_sq_mean = 0.0
         self.learned_reward_running_count = 0
@@ -376,10 +379,7 @@ class AutoRewardedSAC(SAC):
 
             new_obs, rewards, dones, infos = env.step(actions_np)
             env_rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
-            ground_truth_rewards = np.asarray(
-                [info.get("ground_truth_reward", reward) for info, reward in zip(infos, env_rewards)],
-                dtype=np.float32,
-            )
+            ground_truth_rewards = env_rewards
             policy_rewards = self._mix_policy_reward(env_rewards, r_omega_val)
             
             self.auto_reward_learner.store_transition(
@@ -526,8 +526,15 @@ class AutoRewardedSAC(SAC):
             
             return action, log_prob
 
-        # Meta-update at specified frequency
-        if self.num_timesteps > self.learning_starts and self.num_timesteps % self.reward_update_freq < gradient_steps:
+        # Meta-update at specified frequency, with optional max-update freezing.
+        should_meta_update = (
+            self.num_timesteps > self.learning_starts
+            and self.num_timesteps % self.reward_update_freq < gradient_steps
+        )
+        current_meta_updates = 0 if self.auto_reward_learner is None else self.auto_reward_learner.num_meta_updates
+        can_meta_update = self.max_meta_updates is None or current_meta_updates < self.max_meta_updates
+
+        if should_meta_update and can_meta_update:
             metrics = self.auto_reward_learner.optimize_reward(sample_action_from_mu)
             
             if metrics:
@@ -539,7 +546,12 @@ class AutoRewardedSAC(SAC):
                 self.logger.record("autoreward/reward_mix_alpha", self.last_reward_mix_alpha)
                 self.logger.record("autoreward/raw_learned_reward_mean", self.last_raw_learned_reward_mean)
                 self.logger.record("autoreward/norm_learned_reward_mean", self.last_normalized_learned_reward_mean)
+                self.logger.record("autoreward/reward_learner_frozen", 0.0)
                 self.logger.record("autoreward/meta_loss", metrics.get("meta_loss", 0.0), exclude=("stdout",))
                 self.logger.record("autoreward/mean_R", metrics.get("mean_R_omega", 0.0), exclude=("stdout",))
                 self.logger.record("autoreward/mean_Adv", metrics.get("mean_Advantage", 0.0), exclude=("stdout",))
                 self.logger.record("autoreward/std_Adv", metrics.get("std_Advantage", 0.0), exclude=("stdout",))
+        elif should_meta_update and not can_meta_update:
+            self.autoreward_num_meta_updates = current_meta_updates
+            self.logger.record("autoreward/meta_updates", current_meta_updates)
+            self.logger.record("autoreward/reward_learner_frozen", 1.0)

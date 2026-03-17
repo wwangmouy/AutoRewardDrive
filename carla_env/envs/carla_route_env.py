@@ -10,7 +10,6 @@ from pygame.locals import *
 import random
 
 from config import CONFIG
-from carla_env.rewards import compute_ground_truth_reward
 
 from carla_env.tools.hud import HUD
 from carla_env.navigation.planner import RoadOption, compute_route_waypoints
@@ -163,7 +162,6 @@ class CarlaRouteEnv(gym.Env):
                  viewer_res=(1120, 560), obs_res=(80, 120),
                  reward_fn=None,
                  reward_params=None,
-                 eval_reward_params=None,
                  observation_space=None,
                  encode_state_fn=None,
                  fps=15, action_smoothing=0.0,
@@ -223,7 +221,6 @@ class CarlaRouteEnv(gym.Env):
         self.encode_state_fn = (lambda x: x) if not callable(encode_state_fn) else encode_state_fn
         self.reward_fn = (lambda x: 0) if not callable(reward_fn) else reward_fn
         self.reward_params = reward_params if reward_params is not None else CONFIG.reward_params
-        self.eval_reward_params = eval_reward_params
         self.low_speed_threshold_kmh = float(CONFIG.get("low_speed_threshold_kmh", 1.0))
         self.low_speed_timeout_sec = float(CONFIG.get("low_speed_timeout_sec", 20.0))
         self.low_speed_grace_sec = float(CONFIG.get("low_speed_grace_sec", 5.0))
@@ -631,7 +628,7 @@ class CarlaRouteEnv(gym.Env):
         self.distance_from_center_history.append(self.distance_from_center)
 
         self.last_reward = self.reward_fn(self)
-        self.ground_truth_reward = compute_ground_truth_reward(self, self.eval_reward_params)
+        self.ground_truth_reward = self.last_reward
         self.total_reward += self.last_reward
 
         encoded_state = self.encode_state_fn(self)

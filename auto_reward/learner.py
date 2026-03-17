@@ -25,8 +25,7 @@ class AutoRewardLearner:
                  state_dim, 
                  action_dim, 
                  device, 
-                 config,
-                 eval_reward_params=None):
+                 config):
         
         self.device = device
         self.config = config

@@ -187,7 +187,6 @@ if __name__ == "__main__":
     env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
                         reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
                         reward_params=CONFIG.reward_params,
-                        eval_reward_params=CONFIG.get("eval_reward_params"),
                         encode_state_fn=encode_state_fn, fps=args["fps"], action_smoothing=CONFIG.action_smoothing,
                         eval=True, action_space_type=action_space_type, activate_spectator=True, activate_render=True,
                         activate_bev=True, activate_seg_bev=CONFIG.use_seg_bev, start_carla=True,

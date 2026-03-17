@@ -161,7 +161,7 @@ algorithm_params = {
         tau=0.02,
         train_freq=64,
         gradient_steps=64,
-        learning_starts=5000,
+        learning_starts=10000,
         use_sde=True,
         policy_kwargs=dict(
             log_std_init=-1,  # Higher initial std for more exploration (exp(-1) ≈ 0.37)
@@ -213,19 +213,6 @@ reward_params = {
         penalty_reward=-10.0,
         success_reward=5.0,
         progress_reward_scale=20.0,
-    ),
-    # Evaluation reward config (Ground Truth)
-    "reward_eval": dict(
-        early_stop=True,
-        target_speed=25.0,
-        reward_progress=20.0,
-        penalty_collision=-20.0,
-        penalty_offtrack=-12.0,
-        penalty_stuck=-8.0,
-        penalty_too_fast=-6.0,
-        penalty_failure=-10.0,
-        reward_success=100.0,
-        reward_time=-0.05,
     )
 }
 
@@ -269,15 +256,14 @@ _CONFIG_3 = {
     "gamma": 0.98,  # Discount factor for AutoReward
     "state": states["5"],
     "action_space_type": "continuous",
-    "action_smoothing": 0.85,
-    "longitudinal_smoothing": 0.9,
-    "max_steer_delta": 0.08,
+    "action_smoothing": 0.0,
+    "longitudinal_smoothing": 0.0,
+    "max_steer_delta": 1.0,
     "low_speed_threshold_kmh": 1.0,
     "low_speed_timeout_sec": 20.0,
     "low_speed_grace_sec": 5.0,
     "reward_fn": "reward_fn_progress_simple",
     "reward_params": reward_params["reward_progress_simple"],
-    "eval_reward_params": reward_params["reward_eval"],
     "obs_res": (80, 120),
     "seed": 100,
     "wrappers": [],
@@ -285,16 +271,17 @@ _CONFIG_3 = {
     "use_seg_bev": True,
     "use_rgb_bev": False,
     # AutoReward specific parameters
-    "reward_update_freq": 1024,  # Frequency of meta-learning updates
-    "n_samples": 128,  # Number of action samples for reward baseline estimation
-    "reward_buffer_size": 64,  # Max number of trajectories in meta-learning buffer
+    "reward_update_freq": 2048,  # Frequency of meta-learning updates
+    "n_samples": 256,  # Number of action samples for reward baseline estimation
+    "reward_buffer_size": 128,  # Max number of trajectories in meta-learning buffer
     "reward_state_keys": ["vehicle_measures", "waypoints"],
     "reward_output_scale": 1.0,
     "reward_lr": 1e-4,
     "value_lr": 3e-4,
-    "reward_mix_beta": 0.1,
-    "reward_mix_start_meta_updates": 40,
-    "reward_mix_full_meta_updates": 200,
+    "reward_mix_beta": 0.06,
+    "reward_mix_start_meta_updates": 20,
+    "reward_mix_full_meta_updates": 120,
+    "max_meta_updates": 240,
     "learned_reward_stats_momentum": 0.01,
     "action_smoothness_horizon": 4,
     "steer_smoothness_coef": 0.2,

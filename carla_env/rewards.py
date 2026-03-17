@@ -39,40 +39,6 @@ def create_reward_fn(reward_fn):
     return func
 
 
-def compute_ground_truth_reward(env, params):
-    """
-    Sparse task reward used by the upper-level optimization.
-    This is intentionally independent from the dense shaping reward used by the environment.
-    """
-    if params is None:
-        return 0.0
-
-    reward = float(params.get("reward_time", 0.0))
-    reward += float(params.get("reward_progress", 0.0)) * float(getattr(env, "progress_delta", 0.0))
-    penalty_collision = float(params.get("penalty_collision", -10.0))
-    penalty_failure = float(params.get("penalty_failure", penalty_collision))
-    penalty_offtrack = float(params.get("penalty_offtrack", penalty_failure))
-    penalty_stuck = float(params.get("penalty_stuck", penalty_failure))
-    penalty_too_fast = float(params.get("penalty_too_fast", penalty_failure))
-    reward_success = float(params.get("reward_success", 0.0))
-
-    if env.success_state:
-        reward += reward_success
-    elif env.terminal_state:
-        terminal_reason = getattr(env, "terminal_reason", "")
-        if env.collision_state:
-            reward += penalty_collision
-        elif terminal_reason == "Off-track":
-            reward += penalty_offtrack
-        elif terminal_reason == "Vehicle stuck":
-            reward += penalty_stuck
-        elif terminal_reason == "Too fast":
-            reward += penalty_too_fast
-        else:
-            reward += penalty_failure
-
-    return reward
-
 def reward_fn_revolve(env):
     """
     Revolve reward function
