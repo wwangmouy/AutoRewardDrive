@@ -207,12 +207,12 @@ reward_params = {
     "reward_progress_simple": dict(
         early_stop=True,
         max_speed=35.0,
-        max_distance=3.0,
+        max_distance=1.5,
         max_std_center_lane=0.4,
         max_angle_center_lane=90.0,
-        penalty_reward=-10.0,
-        success_reward=5.0,
-        progress_reward_scale=20.0,
+        penalty_reward=-1.0,
+        success_reward=0.3,
+        progress_reward_scale=0.7,
     )
 }
 
@@ -275,13 +275,13 @@ _CONFIG_3 = {
     "n_samples": 256,  # Number of action samples for reward baseline estimation
     "reward_buffer_size": 128,  # Max number of trajectories in meta-learning buffer
     "reward_state_keys": ["vehicle_measures", "waypoints"],
-    "reward_output_scale": 1.0,
+    "reward_output_scale": 0.8,
     "reward_lr": 1e-4,
     "value_lr": 3e-4,
-    "reward_mix_beta": 0.06,
-    "reward_mix_start_meta_updates": 20,
-    "reward_mix_full_meta_updates": 120,
-    "max_meta_updates": 240,
+    "reward_mix_beta": 0.03,
+    "reward_mix_start_meta_updates": 30,
+    "reward_mix_full_meta_updates": 140,
+    "max_meta_updates": 180,
     "learned_reward_stats_momentum": 0.01,
     "action_smoothness_horizon": 4,
     "steer_smoothness_coef": 0.2,
