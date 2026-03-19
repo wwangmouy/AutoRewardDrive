@@ -1,4 +1,7 @@
+from copy import deepcopy
+
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -6,7 +9,7 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, RolloutReturn
-from stable_baselines3.common.utils import should_collect_more_steps
+from stable_baselines3.common.utils import polyak_update, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 
 from auto_reward.learner import AutoRewardLearner
@@ -52,6 +55,13 @@ class AutoRewardedSAC(SAC):
         self.config = config
         self.reward_update_freq = config.get('reward_update_freq', 2048)
         self.auto_reward_learner = None
+        smooth_cfg = config.get("policy_smooth_reg", {})
+        self.policy_smooth_reg_enabled = bool(smooth_cfg.get("enabled", False))
+        self.policy_smooth_reg_coef = float(smooth_cfg.get("coef", 0.0))
+        self.policy_smooth_reg_dims = smooth_cfg.get("dims", "all")
+        self.policy_smooth_reg_source = smooth_cfg.get("source", "recent_rollout")
+        self._smooth_rollout_segments: List[List[Any]] = []
+        self._smooth_current_episode_obs: List[Any] = []
         
         super().__init__(
             policy, env, learning_rate, buffer_size, learning_starts, batch_size,
@@ -157,7 +167,87 @@ class AutoRewardedSAC(SAC):
         
         return model
 
+    @staticmethod
+    def _clone_observation(obs: Any) -> Any:
+        return deepcopy(obs)
 
+    def _reset_smooth_rollout_cache(self) -> None:
+        self._smooth_rollout_segments = []
+        self._smooth_current_episode_obs = []
+
+    def _append_smooth_observation(self, obs: Any) -> None:
+        self._smooth_current_episode_obs.append(self._clone_observation(obs))
+
+    def _finalize_smooth_episode(self) -> None:
+        if len(self._smooth_current_episode_obs) > 1:
+            self._smooth_rollout_segments.append(self._smooth_current_episode_obs)
+        self._smooth_current_episode_obs = []
+
+    @staticmethod
+    def _stack_observation_sequence(obs_sequence: List[Any]) -> Any:
+        first_obs = obs_sequence[0]
+        if isinstance(first_obs, dict):
+            return {
+                key: np.concatenate([np.array(obs[key], copy=True) for obs in obs_sequence], axis=0)
+                for key in first_obs.keys()
+            }
+        return np.concatenate([np.array(obs, copy=True) for obs in obs_sequence], axis=0)
+
+    def _compute_policy_smooth_regularization(self) -> Tuple[torch.Tensor, Dict[str, float]]:
+        zero = torch.zeros((), device=self.device)
+        metrics = {
+            "actor_smooth_loss": 0.0,
+            "mean_action_delta": 0.0,
+            "mean_steer_delta": 0.0,
+            "mean_throttle_delta": 0.0,
+        }
+
+        if (
+            not self.policy_smooth_reg_enabled
+            or self.policy_smooth_reg_coef <= 0.0
+            or self.policy_smooth_reg_source != "recent_rollout"
+            or len(self._smooth_rollout_segments) == 0
+        ):
+            return zero, metrics
+
+        smooth_terms: List[torch.Tensor] = []
+        action_delta_terms: List[torch.Tensor] = []
+        steer_delta_terms: List[torch.Tensor] = []
+        throttle_delta_terms: List[torch.Tensor] = []
+
+        for obs_sequence in self._smooth_rollout_segments:
+            if len(obs_sequence) < 2:
+                continue
+
+            stacked_obs = self._stack_observation_sequence(obs_sequence)
+            obs_tensor, _ = self.policy.obs_to_tensor(stacked_obs)
+            deterministic_actions = self.actor(obs_tensor, deterministic=True)
+            action_deltas = deterministic_actions[1:] - deterministic_actions[:-1]
+            if action_deltas.shape[0] == 0:
+                continue
+
+            if self.policy_smooth_reg_dims == "steer":
+                smooth_deltas = action_deltas[:, :1]
+            else:
+                smooth_deltas = action_deltas
+
+            smooth_terms.append(smooth_deltas.pow(2).sum(dim=1))
+            action_delta_terms.append(action_deltas.norm(dim=1).detach())
+            steer_delta_terms.append(action_deltas[:, 0].abs().detach())
+            if action_deltas.shape[1] > 1:
+                throttle_delta_terms.append(action_deltas[:, 1].abs().detach())
+
+        if len(smooth_terms) == 0:
+            return zero, metrics
+
+        smooth_loss = torch.cat(smooth_terms).mean()
+        metrics["actor_smooth_loss"] = float(smooth_loss.detach().item())
+        metrics["mean_action_delta"] = float(torch.cat(action_delta_terms).mean().item())
+        metrics["mean_steer_delta"] = float(torch.cat(steer_delta_terms).mean().item())
+        if len(throttle_delta_terms) > 0:
+            metrics["mean_throttle_delta"] = float(torch.cat(throttle_delta_terms).mean().item())
+
+        return smooth_loss, metrics
 
     def collect_rollouts(
         self,
@@ -175,9 +265,11 @@ class AutoRewardedSAC(SAC):
         
         assert isinstance(env, VecEnv) and env.num_envs == 1, "Only supports single env"
 
+        self._reset_smooth_rollout_cache()
         callback.on_rollout_start()
 
         while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
+            self._append_smooth_observation(self._last_obs)
             if self.use_sde:
                 self.actor.reset_noise(env.num_envs)
 
@@ -217,6 +309,7 @@ class AutoRewardedSAC(SAC):
             real_next_obs = new_obs.copy()
             for idx, done in enumerate(dones):
                 if done:
+                    self._finalize_smooth_episode()
                     if infos[idx].get("terminal_observation") is not None:
                         self.auto_reward_learner.on_episode_end()
                         num_collected_episodes += 1
@@ -232,14 +325,106 @@ class AutoRewardedSAC(SAC):
             callback.update_locals(locals())
             
             if callback.on_step() is False:
+                self._finalize_smooth_episode()
                 return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
         
+        self._finalize_smooth_episode()
         callback.on_rollout_end()
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=True)
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
-        """Train with periodic meta-gradient updates."""
-        super().train(gradient_steps, batch_size)
+        """Train SAC with action smoothness regularization and periodic meta-gradient updates."""
+        self.policy.set_training_mode(True)
+
+        optimizers = [self.actor.optimizer, self.critic.optimizer]
+        if self.ent_coef_optimizer is not None:
+            optimizers += [self.ent_coef_optimizer]
+        self._update_learning_rate(optimizers)
+
+        ent_coef_losses, ent_coefs = [], []
+        actor_losses, critic_losses = [], []
+        smooth_losses = []
+        mean_action_deltas = []
+        mean_steer_deltas = []
+        mean_throttle_deltas = []
+
+        for gradient_step in range(gradient_steps):
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+
+            if self.use_sde:
+                self.actor.reset_noise()
+
+            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+            log_prob = log_prob.reshape(-1, 1)
+
+            ent_coef_loss = None
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                ent_coef = torch.exp(self.log_ent_coef.detach())
+                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                ent_coef_losses.append(ent_coef_loss.item())
+            else:
+                ent_coef = self.ent_coef_tensor
+            ent_coefs.append(ent_coef.item())
+
+            if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+
+            with torch.no_grad():
+                next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
+                next_q_values = torch.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
+                next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+
+            current_q_values = self.critic(replay_data.observations, replay_data.actions)
+            critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+            critic_losses.append(critic_loss.item())
+
+            self.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic.optimizer.step()
+
+            q_values_pi = torch.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+            min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
+            actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+
+            smooth_metrics = {
+                "actor_smooth_loss": 0.0,
+                "mean_action_delta": 0.0,
+                "mean_steer_delta": 0.0,
+                "mean_throttle_delta": 0.0,
+            }
+            if self.num_timesteps > self.learning_starts:
+                smooth_loss, smooth_metrics = self._compute_policy_smooth_regularization()
+                actor_loss = actor_loss + self.policy_smooth_reg_coef * smooth_loss
+
+            actor_losses.append(actor_loss.item())
+            smooth_losses.append(smooth_metrics["actor_smooth_loss"])
+            mean_action_deltas.append(smooth_metrics["mean_action_delta"])
+            mean_steer_deltas.append(smooth_metrics["mean_steer_delta"])
+            mean_throttle_deltas.append(smooth_metrics["mean_throttle_delta"])
+
+            self.actor.optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor.optimizer.step()
+
+            if gradient_step % self.target_update_interval == 0:
+                polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+
+        self._n_updates += gradient_steps
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/ent_coef", np.mean(ent_coefs))
+        self.logger.record("train/actor_loss", np.mean(actor_losses))
+        self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("smooth/actor_smooth_loss", np.mean(smooth_losses) if smooth_losses else 0.0)
+        self.logger.record("smooth/mean_action_delta", np.mean(mean_action_deltas) if mean_action_deltas else 0.0)
+        self.logger.record("smooth/mean_steer_delta", np.mean(mean_steer_deltas) if mean_steer_deltas else 0.0)
+        self.logger.record("smooth/mean_throttle_delta", np.mean(mean_throttle_deltas) if mean_throttle_deltas else 0.0)
+        if len(ent_coef_losses) > 0:
+            self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
         
         def sample_action_from_mu(mu_batch, n_samples):
             """Resample actions from policy distribution."""

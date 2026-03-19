@@ -437,7 +437,10 @@ class CarlaRouteEnv(gym.Env):
             elif self.action_space_type == "discrete":
                 throttle, steer = discrete_actions[int(action)]
 
-            self.vehicle.control.steer = smooth_action(self.vehicle.control.steer, steer, self.action_smoothing)
+            if self.action_smoothing > 0.0:
+                self.vehicle.control.steer = smooth_action(self.vehicle.control.steer, steer, self.action_smoothing)
+            else:
+                self.vehicle.control.steer = steer
             if throttle >= 0:
                 self.vehicle.control.throttle = throttle
                 self.vehicle.control.brake = 0
@@ -844,4 +847,3 @@ class CarlaRouteEnv(gym.Env):
 
 if __name__ == "__main__":
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-

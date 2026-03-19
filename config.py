@@ -139,7 +139,7 @@ algorithm_params = {
         tau=0.02,
         train_freq=64,
         gradient_steps=64,
-        learning_starts=5000,
+        learning_starts=10000,
         use_sde=True,
         policy_kwargs=dict(
             log_std_init=-1,  # Higher initial std for more exploration (exp(-1) ≈ 0.37)
@@ -210,8 +210,8 @@ _CONFIG_3 = {
     "algorithm_params": algorithm_params["SAC_AUTO"],
     "gamma": 0.98,  # Discount factor for AutoReward
     "state": states["5"],
-    "action_smoothing": 0.75,
-    "reward_fn": "reward_fn_Chen", # Initial reward fn, will be overridden by AutoReward
+    "action_smoothing": 0.0,
+    "reward_fn": "reward_fn5_simple", # Initial reward fn, will be overridden by AutoReward
     "reward_params": reward_params["reward_fn_5_default"],
     "eval_reward_params": reward_params["reward_eval"],
     "obs_res": (80, 120),
@@ -224,6 +224,12 @@ _CONFIG_3 = {
     "reward_update_freq": 2048,  # Frequency of meta-learning updates
     "n_samples": 1000,  # Number of action samples for reward baseline estimation
     "reward_buffer_size": 100,  # Max number of trajectories in meta-learning buffer
+    "policy_smooth_reg": {
+        "enabled": True,
+        "coef": 0.08,
+        "dims": "all",
+        "source": "recent_rollout",
+    },
 }
 
 CONFIGS = {
@@ -239,4 +245,3 @@ def set_config(config_name):
     global CONFIG
     CONFIG = Box(CONFIGS[config_name], default_box=True)
     return CONFIG
-
