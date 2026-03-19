@@ -377,27 +377,18 @@ reward_functions["reward_fn_safe_simple"] = create_reward_fn(reward_fn_safe_simp
 def reward_fn_progress_simple(env):
     """
     Minimal route-following reward:
-    progress bonus (gated by lane-centering and heading alignment)
-    + success bonus + failure penalty.
+    progress bonus + success bonus + failure penalty.
     Safety is handled by environment termination, not by extra handcrafted terms here.
     """
     penalty_reward = float(_reward_param(env, "penalty_reward", -10.0))
     success_reward = float(_reward_param(env, "success_reward", 5.0))
     progress_reward_scale = float(_reward_param(env, "progress_reward_scale", 20.0))
-    max_distance = float(_reward_param(env, "max_distance", 3.0))
-    max_angle_center_lane = float(_reward_param(env, "max_angle_center_lane", 90.0))
 
     if env.success_state:
         return success_reward
     if env.terminal_state:
         return penalty_reward
-
-    progress_delta = float(getattr(env, "progress_delta", 0.0))
-    angle = env.vehicle.get_angle(env.current_waypoint)
-    centering_factor = max(1.0 - env.distance_from_center / max(max_distance, 1e-6), 0.0)
-    angle_factor = max(1.0 - abs(angle) / max(np.deg2rad(max_angle_center_lane), 1e-6), 0.0)
-
-    return progress_reward_scale * progress_delta * centering_factor * angle_factor
+    return progress_reward_scale * float(getattr(env, "progress_delta", 0.0))
 
 
 reward_functions["reward_fn_progress_simple"] = create_reward_fn(reward_fn_progress_simple)

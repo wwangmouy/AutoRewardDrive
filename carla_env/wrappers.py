@@ -56,13 +56,16 @@ def angle_diff(v0, v1):
 
     v0_xy_u = v0_xy / v0_xy_norm
     v1_xy_u = v1_xy / v1_xy_norm
-    dot_product = float(np.clip(np.dot(v0_xy_u, v1_xy_u), -1.0, 1.0))
-    cross_product = float(np.cross(v0_xy_u, v1_xy_u))
+    dot_product = np.dot(v0_xy_u, v1_xy_u)
+    angle = np.arccos(dot_product)
 
-    # Signed principal angle in [-pi, pi]. This avoids the previous blind spot
-    # where very large heading errors were mapped back to zero.
-    angle = np.arctan2(cross_product, dot_product)
-    return round(float(angle), 2)
+    # Calculate the sign of the angle using the cross product
+    cross_product = np.cross(v0_xy_u, v1_xy_u)
+    if cross_product < 0:
+        angle = -angle
+    if abs(angle) >= 2.3:
+        return 0
+    return round(angle, 2)
 
 
 def distance_to_line(A, B, p):
