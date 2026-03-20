@@ -325,6 +325,42 @@ class CarlaRouteEnv(gym.Env):
             return float(route_length - max_waypoints)
         return 0.0
 
+    def get_expert_action(self):
+        """Return a lightweight route-following expert action [steer, throttle]."""
+        if not hasattr(self, "current_waypoint") or not hasattr(self, "next_waypoint"):
+            return np.array([0.0, 0.2], dtype=np.float32)
+
+        transform = self.vehicle.get_transform()
+        target_loc = self.next_waypoint.transform.location
+        ego_loc = transform.location
+
+        ego_yaw = np.deg2rad(transform.rotation.yaw)
+        heading = np.array([np.cos(ego_yaw), np.sin(ego_yaw)], dtype=np.float32)
+        target_vec = np.array([target_loc.x - ego_loc.x, target_loc.y - ego_loc.y], dtype=np.float32)
+
+        norm = np.linalg.norm(target_vec)
+        if norm < 1e-4:
+            target_dir = heading
+        else:
+            target_dir = target_vec / norm
+
+        dot = float(np.clip(np.dot(heading, target_dir), -1.0, 1.0))
+        cross = float(heading[0] * target_dir[1] - heading[1] * target_dir[0])
+        heading_error = float(np.arctan2(cross, dot))
+
+        steer = float(np.clip(1.35 * heading_error, -1.0, 1.0))
+
+        speed = self.vehicle.get_speed()
+        target_speed = 24.0
+        if abs(heading_error) > 0.35:
+            target_speed = 16.0
+        if abs(heading_error) > 0.65:
+            target_speed = 10.0
+
+        speed_error = target_speed - speed
+        throttle = float(np.clip(0.06 * speed_error, -0.5, 0.75))
+        return np.array([steer, throttle], dtype=np.float32)
+
     def _set_terminal_state(self, reason):
         if not self.success_state and not self.terminal_state:
             self.terminal_state = True

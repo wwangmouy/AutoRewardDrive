@@ -59,6 +59,9 @@ class AutoRewardedSAC(SAC):
         self.reward_warmstart_enabled = bool(warmstart_cfg.get("enabled", False))
         self.reward_warmstart_min_success = int(warmstart_cfg.get("min_success_trajectories", 0))
         self.reward_warmstart_min_failure = int(warmstart_cfg.get("min_failure_trajectories", 0))
+        self.expert_bootstrap_steps = int(config.get("expert_bootstrap_steps", 0))
+        self.policy_collect_only_until = int(config.get("policy_collect_only_until", learning_starts))
+        self.use_gt_reward_before_warmstart = bool(config.get("use_gt_reward_before_warmstart", False))
         smooth_cfg = config.get("policy_smooth_reg", {})
         self.policy_smooth_reg_enabled = bool(smooth_cfg.get("enabled", False))
         self.policy_smooth_reg_coef = float(smooth_cfg.get("coef", 0.0))
@@ -274,6 +277,35 @@ class AutoRewardedSAC(SAC):
             self.reward_warmstart_min_failure,
         )
 
+    @staticmethod
+    def _unwrap_single_env(vec_env: VecEnv) -> Optional[Any]:
+        if not hasattr(vec_env, "envs") or len(vec_env.envs) == 0:
+            return None
+        env = vec_env.envs[0]
+        max_depth = 10
+        for _ in range(max_depth):
+            if env is None:
+                return None
+            if hasattr(env, "get_expert_action"):
+                return env
+            if hasattr(env, "unwrapped") and env.unwrapped is not env and hasattr(env.unwrapped, "get_expert_action"):
+                return env.unwrapped
+            if hasattr(env, "env"):
+                env = env.env
+                continue
+            break
+        return env if hasattr(env, "get_expert_action") else None
+
+    def _query_expert_action(self, vec_env: VecEnv) -> Optional[np.ndarray]:
+        env = self._unwrap_single_env(vec_env)
+        if env is None or not hasattr(env, "get_expert_action"):
+            return None
+        action = env.get_expert_action()
+        if action is None:
+            return None
+        action_np = np.asarray(action, dtype=np.float32).reshape(1, -1)
+        return action_np
+
     def collect_rollouts(
         self,
         env: VecEnv,
@@ -298,18 +330,27 @@ class AutoRewardedSAC(SAC):
             if self.use_sde:
                 self.actor.reset_noise(env.num_envs)
 
+            use_expert_policy = self.num_timesteps < self.expert_bootstrap_steps
+            expert_actions_np = self._query_expert_action(env) if use_expert_policy else None
+
             with torch.no_grad():
                 obs_tensor, _ = self.policy.obs_to_tensor(self._last_obs)
                 features = self.actor.extract_features(obs_tensor, self.actor.features_extractor)
                 mean_actions, log_std, _ = self.actor.get_action_dist_params(obs_tensor)
-                # Use non_blocking to reduce sync overhead
-                mu = (mean_actions.detach(), log_std.detach())  # Keep on GPU, transfer later
-                actions, log_probs = self.actor.action_log_prob(obs_tensor)
-                actions_np = actions.cpu(memory_format=torch.contiguous_format).numpy()
-                log_probs_np = log_probs.cpu(memory_format=torch.contiguous_format).numpy()
+                mu = (mean_actions.detach(), log_std.detach())
+
+                if expert_actions_np is not None:
+                    actions_np = expert_actions_np
+                    actions_tensor = torch.as_tensor(actions_np, device=self.device)
+                    log_probs_np = np.zeros((env.num_envs, 1), dtype=np.float32)
+                else:
+                    actions, log_probs = self.actor.action_log_prob(obs_tensor)
+                    actions_np = actions.cpu(memory_format=torch.contiguous_format).numpy()
+                    actions_tensor = actions
+                    log_probs_np = log_probs.cpu(memory_format=torch.contiguous_format).numpy()
                 
                 # Compute learned reward R_omega inline (avoid redundant tensor conversion)
-                r_omega = self.auto_reward_learner.get_reward(features, actions)
+                r_omega = self.auto_reward_learner.get_reward(features, actions_tensor)
                 r_omega_val = r_omega.cpu(memory_format=torch.contiguous_format).numpy().flatten()
                 
                 # Cache features on CPU (single transfer)
@@ -320,11 +361,14 @@ class AutoRewardedSAC(SAC):
             gt_reward = float(rewards[0])
             learned_reward = float(r_omega_val[0])
             warmstart_ready = self._is_reward_warmstart_ready()
-            train_reward_array = np.array([learned_reward], dtype=np.float32)
+            use_gt_reward_for_training = self.use_gt_reward_before_warmstart and not warmstart_ready
+            train_reward = gt_reward if use_gt_reward_for_training else learned_reward
+            train_reward_array = np.array([train_reward], dtype=np.float32)
             infos[0]["ground_truth_reward"] = gt_reward
             infos[0]["learned_reward"] = learned_reward
-            infos[0]["train_reward"] = learned_reward
+            infos[0]["train_reward"] = train_reward
             infos[0]["warmstart_ready"] = warmstart_ready
+            infos[0]["expert_bootstrap_active"] = float(expert_actions_np is not None)
             
             # Store for meta-learning (ground truth reward)
             self.auto_reward_learner.store_transition(
@@ -374,6 +418,13 @@ class AutoRewardedSAC(SAC):
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         """Train SAC with action smoothness regularization and periodic meta-gradient updates."""
         self.policy.set_training_mode(True)
+
+        if self.num_timesteps < self.policy_collect_only_until:
+            self.logger.record("autoreward/collect_only_phase", 1.0)
+            self.logger.record("autoreward/train_enabled", 0.0)
+            return
+        self.logger.record("autoreward/collect_only_phase", 0.0)
+        self.logger.record("autoreward/train_enabled", 1.0)
 
         optimizers = [self.actor.optimizer, self.critic.optimizer]
         if self.ent_coef_optimizer is not None:

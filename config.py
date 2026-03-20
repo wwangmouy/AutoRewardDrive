@@ -234,9 +234,12 @@ _CONFIG_3 = {
     },
     "reward_warmstart": {
         "enabled": True,
-        "min_success_trajectories": 20,
-        "min_failure_trajectories": 20,
+        "min_success_trajectories": 3,
+        "min_failure_trajectories": 10,
     },
+    "expert_bootstrap_steps": 5000,
+    "policy_collect_only_until": 10000,
+    "use_gt_reward_before_warmstart": True,
     "policy_smooth_reg": {
         "enabled": True,
         "coef": 0.01,
