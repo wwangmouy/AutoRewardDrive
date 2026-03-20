@@ -224,6 +224,19 @@ _CONFIG_3 = {
     "reward_update_freq": 2048,  # Frequency of meta-learning updates
     "n_samples": 1000,  # Number of action samples for reward baseline estimation
     "reward_buffer_size": 100,  # Max number of trajectories in meta-learning buffer
+    "train_curriculum": {
+        "enabled": True,
+        "phases": [
+            {"episode_end": 300, "min_waypoints": 20, "max_waypoints": 60, "tf_num": 0},
+            {"episode_end": 800, "min_waypoints": 60, "max_waypoints": 120, "tf_num": 10},
+            {"episode_end": -1, "min_waypoints": 120, "max_waypoints": None, "tf_num": 20},
+        ],
+    },
+    "reward_warmstart": {
+        "enabled": True,
+        "min_success_trajectories": 20,
+        "min_failure_trajectories": 20,
+    },
     "policy_smooth_reg": {
         "enabled": True,
         "coef": 0.01,

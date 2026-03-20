@@ -110,10 +110,10 @@ class TensorboardCallback(BaseCallback):
                 self.episode_ground_truth_rewards.append(
                     self.locals['infos'][0]['ground_truth_reward']
                 )
-            # Get learned reward from replay buffer (most recent)
-            if hasattr(self.model, 'replay_buffer') and self.model.replay_buffer.pos > 0:
-                last_learned_reward = self.model.replay_buffer.rewards[self.model.replay_buffer.pos - 1]
-                self.episode_learned_rewards.append(float(last_learned_reward))
+            if 'learned_reward' in self.locals.get('infos', [{}])[0]:
+                self.episode_learned_rewards.append(
+                    self.locals['infos'][0]['learned_reward']
+                )
 
         # Log scalar value (here a random variable)
         if self.locals['dones'][0]:
@@ -138,6 +138,10 @@ class TensorboardCallback(BaseCallback):
                 learner = self.model.auto_reward_learner
                 # Trajectory buffer size
                 self.logger.record("autoreward/trajectory_buffer_size", len(learner.D_xi))
+                self.logger.record("autoreward/success_traj_count", learner.success_traj_count)
+                self.logger.record("autoreward/failure_traj_count", learner.failure_traj_count)
+                if 'warmstart_ready' in self.locals['infos'][0]:
+                    self.logger.record("autoreward/warmstart_ready", float(self.locals['infos'][0]['warmstart_ready']))
                 
                 # Episode-level reward comparison
                 if self.episode_learned_rewards:

@@ -1,236 +1,192 @@
+import random
+from collections import deque, namedtuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-from collections import deque, namedtuple
-import random
 
 from auto_reward.networks import RewardNetwork, ValueFunction
 
-# Define Transition tuple to store all necessary data for meta-learning
-Transition = namedtuple('Transition', 
-                        ['state', 'action', 'reward', 'log_prob', 'mu', 'overline_V'])
+
+Transition = namedtuple("Transition", ["state", "action", "gt_reward", "gt_return"])
+
 
 class AutoRewardLearner:
     """
-    Core Logic for Optimal Reward Discovery.
-    
-    Responsibilities:
-    1. Manage RewardNetwork R_omega(s, a)
-    2. Manage ValueFunction V(s) (Ground Truth)
-    3. Store Trajectories in Buffer D_xi
-    4. Compute Meta-Gradient Update
+    Trajectory-level approximation of the upper-level reward optimization.
+
+    The learner stores trajectories using the ground-truth reward, then
+    recomputes learned trajectory returns under the current reward network.
+    Reward updates maximize the alignment between GT advantage and learned
+    advantage, following the stationary simplification of equation (21).
     """
-    def __init__(self, 
-                 state_dim, 
-                 action_dim, 
-                 device, 
-                 config,
-                 eval_reward_params=None):
-        
+
+    def __init__(self, state_dim, action_dim, device, config, eval_reward_params=None):
         self.device = device
         self.config = config
-        
-        # Hyperparameters
+
         self.gamma = config.gamma
         self.reward_lr = 1e-4
-        self.value_lr = 3e-4 # Usually higher than reward LR
-        self.n_samples = config.get('n_samples', 1000) # Number of samples for expectation estimation
-        self.reward_buffer_size = config.get('reward_buffer_size', 100) # Max number of trajectories
-        
-        # 1. Trainable Reward Function R_omega(s, a)
+        self.value_lr = 3e-4
+        self.reward_buffer_size = config.get("reward_buffer_size", 100)
+        self.trajectory_batch_size = min(16, self.reward_buffer_size)
+
         self.reward_net = RewardNetwork(
-            state_dim=state_dim, 
-            action_dim=action_dim, 
-            hidden_dim=256, 
-            encode_dim=64
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=256,
+            encode_dim=64,
         ).to(device)
         self.reward_optimizer = optim.Adam(self.reward_net.parameters(), lr=self.reward_lr)
-        
-        # 2. Value Function V(s) - Predicts Ground Truth Return
-        self.value_net = ValueFunction(input_dim=state_dim).to(device)
-        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=self.value_lr)
-        
-        # 3. Data Storage
-        self.D_xi = deque(maxlen=self.reward_buffer_size) # Trajectory buffer
-        self.current_episode_data = [] # Temp storage for current episode
-        self._pending_transitions = []  # Batch processing buffer
-        self._batch_size = 64  # Process every N steps
-        
+
+        self.gt_value_net = ValueFunction(input_dim=state_dim).to(device)
+        self.gt_value_optimizer = optim.Adam(self.gt_value_net.parameters(), lr=self.value_lr)
+
+        self.learned_value_net = ValueFunction(input_dim=state_dim).to(device)
+        self.learned_value_optimizer = optim.Adam(self.learned_value_net.parameters(), lr=self.value_lr)
+
+        self.D_xi = deque(maxlen=self.reward_buffer_size)
+        self.trajectory_outcomes = deque(maxlen=self.reward_buffer_size)
+        self.current_episode_data = []
+
+    @property
+    def success_traj_count(self):
+        return int(sum(1 for outcome in self.trajectory_outcomes if outcome))
+
+    @property
+    def failure_traj_count(self):
+        return int(sum(1 for outcome in self.trajectory_outcomes if not outcome))
+
+    def has_bootstrap_data(self, min_success_trajectories, min_failure_trajectories):
+        return (
+            self.success_traj_count >= min_success_trajectories
+            and self.failure_traj_count >= min_failure_trajectories
+        )
+
     def get_reward(self, state, action):
-        """
-        Returns R_omega(s, a) for the Agent's training.
-        """
         with torch.no_grad():
             return self.reward_net(state, action)
 
-    def store_transition(self, state, action, reward, log_prob, mu):
-        """
-        Store transition data during rollout.
-        Args:
-            reward: This should be the GROUND TRUTH reward (bar_R)
-            mu: Policy distribution params tuple (mean, log_std, ...) for resampling
-        """
-        # Ensure data is on CPU/Numpy for storage to save VRAM
-        if isinstance(state, torch.Tensor): state = state.detach().cpu().numpy()
-        if isinstance(action, torch.Tensor): action = action.detach().cpu().numpy()
-        if isinstance(log_prob, torch.Tensor): log_prob = log_prob.detach().cpu().numpy()
-        
-        # mu is a tuple of tensors usually
-        mu_cpu = []
-        if isinstance(mu, (tuple, list)):
-            for m in mu:
-                if isinstance(m, torch.Tensor):
-                    mu_cpu.append(m.detach().cpu())
-                else:
-                    mu_cpu.append(m)
-        else:
-            mu_cpu = mu # Fallback
-            
-        t = Transition(state=state, action=action, reward=reward, log_prob=log_prob, mu=tuple(mu_cpu), overline_V=0.0)
-        self.current_episode_data.append(t)
+    def store_transition(self, state, action, reward, log_prob=None, mu=None):
+        if isinstance(state, torch.Tensor):
+            state = state.detach().cpu().numpy()
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
 
-    def on_episode_end(self):
-        """
-        Called when episode finishes. 
-        Computes Ground Truth Return (overline_V) and moves trajectory to D_xi.
-        """
+        transition = Transition(
+            state=np.array(state, copy=True),
+            action=np.array(action, copy=True),
+            gt_reward=float(reward),
+            gt_return=0.0,
+        )
+        self.current_episode_data.append(transition)
+
+    def on_episode_end(self, success=False):
         if not self.current_episode_data:
             return
 
-        R_bar_sum = 0
-        new_trajectory = []
-        
-        # Backward pass to compute discounted return
-        for t in reversed(self.current_episode_data):
-            R_bar_sum = t.reward + self.gamma * R_bar_sum
-            # Update the namedtuple with computed return
-            new_t = t._replace(overline_V=R_bar_sum)
-            new_trajectory.insert(0, new_t)
-            
-        # Store in main buffer
-        self.D_xi.append(new_trajectory)
-        self.current_episode_data = [] # Reset
+        gt_return_sum = 0.0
+        trajectory = []
+        for transition in reversed(self.current_episode_data):
+            gt_return_sum = transition.gt_reward + self.gamma * gt_return_sum
+            trajectory.insert(0, transition._replace(gt_return=gt_return_sum))
 
-    def optimize_reward(self, agent_policy_func):
-        """
-        Meta-Optimization Step.
-        
-        Args:
-            agent_policy_func: Function to resample actions from mu. 
-                               Signature: get_action_prob_from_mu(mu, n_samples)
-        """
+        self.D_xi.append(trajectory)
+        self.trajectory_outcomes.append(bool(success))
+        self.current_episode_data = []
+
+    def _discounted_cumsum(self, rewards):
+        returns = torch.zeros_like(rewards)
+        running_return = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+        for idx in range(rewards.shape[0] - 1, -1, -1):
+            running_return = rewards[idx] + self.gamma * running_return
+            returns[idx] = running_return
+        return returns
+
+    def _sample_trajectories(self):
+        if len(self.D_xi) <= self.trajectory_batch_size:
+            return list(self.D_xi)
+        indices = random.sample(range(len(self.D_xi)), self.trajectory_batch_size)
+        return [self.D_xi[idx] for idx in indices]
+
+    def optimize_reward(self, agent_policy_func=None):
         if len(self.D_xi) == 0:
             return {}
 
-        # 1. Flatten trajectories
-        all_steps = [step for traj in self.D_xi for step in traj]
-        # Shuffle for i.i.d updates
-        random.shuffle(all_steps)
-        
-        total_steps = len(all_steps)
-        
-        # --- Phase 1: Compute loss_val_term (C) ---
-        # This requires iterating all data but is cheap (inference only, no graph)
-        accumulator_2 = []
-        states_list = []
-        overline_V_list = []
-        
-        for step in all_steps:
-            s_np, a_np, r_bar, log_prob_np, mu, overline_V = step
-            
-            s = torch.tensor(s_np, device=self.device).float()
-            prob_a = np.exp(log_prob_np)
-            
-            # Estimate V(s) (No grad)
-            with torch.no_grad():
-                V_s = self.value_net(s.unsqueeze(0)).item()
-            
-            advantage = overline_V - V_s
-            accumulator_2.append(prob_a * advantage)
-            
-            # Collect data for Value update
-            states_list.append(s_np)
-            overline_V_list.append(overline_V)
+        sampled_trajectories = self._sample_trajectories()
+        if len(sampled_trajectories) == 0:
+            return {}
 
-        # C = Mean(Acc2)
-        loss_val_term = torch.tensor(accumulator_2, device=self.device).mean()
-        
-        # --- Phase 2: Compute Reward Gradients in Batches ---
+        flat_states = []
+        flat_actions = []
+        flat_gt_returns = []
+        flat_learned_returns = []
+        flat_learned_step_rewards = []
+
+        for trajectory in sampled_trajectories:
+            states_np = np.array([step.state for step in trajectory], dtype=np.float32)
+            actions_np = np.array([step.action for step in trajectory], dtype=np.float32)
+            gt_returns_np = np.array([step.gt_return for step in trajectory], dtype=np.float32)
+
+            states = torch.tensor(states_np, device=self.device)
+            actions = torch.tensor(actions_np, device=self.device)
+            gt_returns = torch.tensor(gt_returns_np, device=self.device)
+
+            learned_step_rewards = self.reward_net(states, actions).squeeze(-1)
+            learned_returns = self._discounted_cumsum(learned_step_rewards)
+
+            flat_states.append(states)
+            flat_actions.append(actions)
+            flat_gt_returns.append(gt_returns)
+            flat_learned_returns.append(learned_returns)
+            flat_learned_step_rewards.append(learned_step_rewards)
+
+        states_all = torch.cat(flat_states, dim=0)
+        actions_all = torch.cat(flat_actions, dim=0)
+        gt_returns_all = torch.cat(flat_gt_returns, dim=0)
+        learned_returns_all = torch.cat(flat_learned_returns, dim=0)
+        learned_step_rewards_all = torch.cat(flat_learned_step_rewards, dim=0)
+
+        self.gt_value_optimizer.zero_grad()
+        gt_value_preds = self.gt_value_net(states_all).squeeze(-1)
+        gt_value_loss = nn.functional.smooth_l1_loss(gt_value_preds, gt_returns_all)
+        gt_value_loss.backward()
+        self.gt_value_optimizer.step()
+
+        self.learned_value_optimizer.zero_grad()
+        learned_value_preds = self.learned_value_net(states_all).squeeze(-1)
+        learned_value_loss = nn.functional.smooth_l1_loss(learned_value_preds, learned_returns_all.detach())
+        learned_value_loss.backward()
+        self.learned_value_optimizer.step()
+
+        gt_value_baseline = self.gt_value_net(states_all).squeeze(-1).detach()
+        learned_value_baseline = self.learned_value_net(states_all).squeeze(-1).detach()
+
+        gt_advantage = (gt_returns_all - gt_value_baseline).detach()
+        learned_advantage = learned_returns_all - learned_value_baseline
+        alignment = gt_advantage * learned_advantage
+        reward_loss = -alignment.mean()
+
         self.reward_optimizer.zero_grad()
-        
-        batch_size = self._batch_size
-        total_reward_loss_sum = 0.0
-        
-        for i in range(0, total_steps, batch_size):
-            batch_steps = all_steps[i : i + batch_size]
-            current_batch_size = len(batch_steps)
-            
-            batch_acc_1 = []
-            
-            for step in batch_steps:
-                s_np, a_np, r_bar, log_prob_np, mu, overline_V = step
-                
-                s = torch.tensor(s_np, device=self.device).float()
-                a_tensor = torch.tensor(a_np, device=self.device).float().unsqueeze(0)
-                
-                # Re-compute R_omega(s, a)
-                r_omega_cur = self.reward_net(s.unsqueeze(0), a_tensor).squeeze(0)
-                
-                # Sample N actions
-                action_samples, log_prob_samples = agent_policy_func(mu, self.n_samples)
-                
-                # Expand state
-                s_expanded = s.unsqueeze(0).repeat(self.n_samples, 1)
-                
-                # Compute R_omega(s, a') for all samples
-                r_omega_samples = self.reward_net(s_expanded, action_samples)
-                
-                # Expectation: mean(R)
-                reward_baseline = torch.mean(r_omega_samples)
-                
-                batch_acc_1.append(r_omega_cur - reward_baseline)
-            
-            # Compute batch loss
-            # Loss = C * Mean(Acc1)
-            # Contribution = C * Sum(Acc1_batch) / N = C * Mean(Acc1_batch) * B / N
-            loss_reward_batch = torch.stack(batch_acc_1).mean()
-            weighted_loss = loss_val_term * loss_reward_batch * (current_batch_size / total_steps)
-            
-            weighted_loss.backward()
-            total_reward_loss_sum += loss_reward_batch.item() * current_batch_size
-
+        reward_loss.backward()
         self.reward_optimizer.step()
-        
-        # --- Phase 3: Optimize Value Function ---
-        # Regress V(s) -> overline_V
-        # Use mini-batches for value update as well to be safe
-        self.value_optimizer.zero_grad()
-        
-        states_tensor_all = torch.tensor(np.array(states_list), device=self.device).float()
-        targets_tensor_all = torch.tensor(np.array(overline_V_list), device=self.device).float().unsqueeze(1)
-        
-        value_loss_sum = 0.0
-        
-        for i in range(0, total_steps, batch_size):
-            end_idx = min(i + batch_size, total_steps)
-            s_batch = states_tensor_all[i:end_idx]
-            target_batch = targets_tensor_all[i:end_idx]
-            
-            preds = self.value_net(s_batch)
-            v_loss = nn.functional.smooth_l1_loss(preds, target_batch)
-            
-            # Scale loss by batch size ratio for correct mean
-            v_loss_scaled = v_loss * ((end_idx - i) / total_steps)
-            v_loss_scaled.backward()
-            
-            value_loss_sum += v_loss.item() * (end_idx - i)
-            
-        self.value_optimizer.step()
-        
+
+        learned_returns_np = learned_returns_all.detach().cpu().numpy()
+        gt_returns_np = gt_returns_all.detach().cpu().numpy()
+        corr = 0.0
+        if learned_returns_np.size > 1:
+            if np.std(learned_returns_np) > 1e-8 and np.std(gt_returns_np) > 1e-8:
+                corr = float(np.corrcoef(gt_returns_np, learned_returns_np)[0, 1])
+                if np.isnan(corr):
+                    corr = 0.0
+
         return {
-            "meta_loss": (loss_val_term * (total_reward_loss_sum / total_steps)).item(),
-            "value_loss": value_loss_sum / total_steps,
-            "mean_R_omega": total_reward_loss_sum / total_steps,
-            "mean_Advantage": loss_val_term.item()
+            "meta_loss": float(reward_loss.detach().item()),
+            "value_loss": float((gt_value_loss.detach().item() + learned_value_loss.detach().item()) / 2.0),
+            "mean_R_omega": float(learned_step_rewards_all.detach().mean().item()),
+            "mean_Advantage": float(gt_advantage.mean().item()),
+            "gt_vs_learned_return_corr": corr,
+            "success_traj_count": self.success_traj_count,
+            "failure_traj_count": self.failure_traj_count,
         }

@@ -165,6 +165,9 @@ class CarlaRouteEnv(gym.Env):
         self.activate_bev = activate_bev
         self.eval = eval
         self.activate_traffic_flow = activate_traffic_flow
+        self.train_curriculum = CONFIG.get("train_curriculum", {})
+        self.base_tf_num = tf_num
+        self.tf_num = tf_num
         self.traffic_flow_vehicles = []
         self.low_speed_timer = 0.0
         self.collision_num = 0
@@ -301,6 +304,27 @@ class CarlaRouteEnv(gym.Env):
 
         return obs
 
+    def _get_curriculum_phase(self):
+        if self.eval or not self.train_curriculum or not self.train_curriculum.get("enabled", False):
+            return None
+
+        episode_num = max(self.episode_idx, 0)
+        for phase in self.train_curriculum.get("phases", []):
+            episode_end = phase.get("episode_end", -1)
+            if episode_end == -1 or episode_num < episode_end:
+                return phase
+        return None
+
+    @staticmethod
+    def _route_length_score(route_length, min_waypoints, max_waypoints):
+        if route_length <= 1:
+            return float("inf")
+        if route_length < min_waypoints:
+            return float(min_waypoints - route_length)
+        if max_waypoints is not None and route_length > max_waypoints:
+            return float(route_length - max_waypoints)
+        return 0.0
+
     def _set_terminal_state(self, reason):
         if not self.success_state and not self.terminal_state:
             self.terminal_state = True
@@ -323,12 +347,39 @@ class CarlaRouteEnv(gym.Env):
         self.vehicle.set_simulate_physics(False)
 
         if not self.eval:
-            if self.episode_idx % 2 == 0 and self.num_routes_completed == -1:
+            curriculum_phase = self._get_curriculum_phase()
+            if curriculum_phase is None and self.episode_idx % 2 == 0 and self.num_routes_completed == -1:
                 spawn_points_list = [self.world.map.get_spawn_points()[index] for index in next(intersection_routes)]
+            elif curriculum_phase is None:
+                spawn_points_list = random.sample(self.world.map.get_spawn_points(), 2)
             else:
-                spawn_points_list = np.random.choice(self.world.map.get_spawn_points(), 2, replace=False)
+                spawn_points = self.world.map.get_spawn_points()
+                min_waypoints = int(curriculum_phase.get("min_waypoints", 2))
+                max_waypoints = curriculum_phase.get("max_waypoints", None)
+                if max_waypoints is not None:
+                    max_waypoints = int(max_waypoints)
+                self.tf_num = int(curriculum_phase.get("tf_num", self.base_tf_num))
+
+                best_candidate = None
+                best_score = float("inf")
+                for _ in range(200):
+                    candidate = random.sample(spawn_points, 2)
+                    start_wp, end_wp = [self.world.map.get_waypoint(spawn.location) for spawn in candidate]
+                    candidate_route = compute_route_waypoints(self.world.map, start_wp, end_wp, resolution=1.0)
+                    route_length = len(candidate_route)
+                    score = self._route_length_score(route_length, min_waypoints, max_waypoints)
+                    if score < best_score:
+                        best_candidate = candidate
+                        best_score = score
+                    if score == 0.0:
+                        break
+
+                spawn_points_list = best_candidate if best_candidate is not None else random.sample(spawn_points, 2)
         else:
             spawn_points_list = [self.world.map.get_spawn_points()[index] for index in next(eval_routes)]
+
+        if self.eval or self._get_curriculum_phase() is None:
+            self.tf_num = self.base_tf_num
         route_length = 1
         while route_length <= 1:
             self.start_wp, self.end_wp = [self.world.map.get_waypoint(spawn.location) for spawn in
@@ -336,7 +387,7 @@ class CarlaRouteEnv(gym.Env):
             self.route_waypoints = compute_route_waypoints(self.world.map, self.start_wp, self.end_wp, resolution=1.0)
             route_length = len(self.route_waypoints)
             if route_length <= 1:
-                spawn_points_list = np.random.choice(self.world.map.get_spawn_points(), 2, replace=False)
+                spawn_points_list = random.sample(self.world.map.get_spawn_points(), 2)
 
         self.distance_from_center_history = deque(maxlen=30)
 
@@ -481,7 +532,7 @@ class CarlaRouteEnv(gym.Env):
                 waypoint_index += 1
             else:
                 break
-        self.current_waypoint_index = waypoint_index
+        self.current_waypoint_index = min(waypoint_index, len(self.route_waypoints) - 1)
 
         if self.current_waypoint_index < len(self.route_waypoints) - 1:
             self.next_waypoint, self.next_road_maneuver = self.route_waypoints[
