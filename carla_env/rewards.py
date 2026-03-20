@@ -18,47 +18,17 @@ reward_functions = {}
 
 def create_reward_fn(reward_fn):
     def func(env):
-        terminal_reason = "Running..."
-        if early_stop:
-            speed = env.vehicle.get_speed()
-            if speed < 1.0:
-                env.low_speed_timer += 1
-            else:
-                env.low_speed_timer = 0.0  # Reset timer if speed goes above threshold
-
-            # Check if speed is low for 90 consecutive second (only during training)
-            if env.low_speed_timer >= 90 * env.fps and not env.eval:
-                env.terminal_state = True
-                terminal_reason = "Vehicle stopped"
-
-            # Stop if distance from center > max distance
-            if env.distance_from_center > max_distance and not env.eval:
-                env.terminal_state = True
-                terminal_reason = "Off-track"
-
-            # Stop if speed is too high
-            if max_speed > 0 and speed > max_speed and not env.eval:
-                env.terminal_state = True
-                terminal_reason = "Too fast"
-
-
-        # Calculate reward
-        reward = 0
-        if not env.terminal_state:
-            reward += reward_fn(env)
+        if env.terminal_state and reward_fn in {reward_fn5}:
+            reward = penalty_reward
         else:
-            env.low_speed_timer = 0.0
-            if reward_fn in {reward_fn5}:
-                reward += penalty_reward
-            print(f"{env.episode_idx}| Terminal: ", terminal_reason)
+            reward = reward_fn(env)
 
+        terminal_reason = getattr(env, "terminal_reason", "Running...")
+        if env.terminal_state:
+            print(f"{env.episode_idx}| Terminal: ", terminal_reason)
         if env.success_state:
             print(f"{env.episode_idx}| Success")
 
-        env.extra_info.extend([
-            terminal_reason,
-            ""
-        ])
         return reward
 
     return func

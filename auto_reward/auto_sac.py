@@ -60,6 +60,7 @@ class AutoRewardedSAC(SAC):
         self.policy_smooth_reg_coef = float(smooth_cfg.get("coef", 0.0))
         self.policy_smooth_reg_dims = smooth_cfg.get("dims", "all")
         self.policy_smooth_reg_source = smooth_cfg.get("source", "recent_rollout")
+        self.policy_smooth_reg_start_after_timesteps = int(smooth_cfg.get("start_after_timesteps", 0))
         self._smooth_rollout_segments: List[List[Any]] = []
         self._smooth_current_episode_obs: List[Any] = []
         
@@ -396,7 +397,8 @@ class AutoRewardedSAC(SAC):
                 "mean_steer_delta": 0.0,
                 "mean_throttle_delta": 0.0,
             }
-            if self.num_timesteps > self.learning_starts:
+            smooth_reg_start = max(self.learning_starts, self.policy_smooth_reg_start_after_timesteps)
+            if self.num_timesteps >= smooth_reg_start:
                 smooth_loss, smooth_metrics = self._compute_policy_smooth_regularization()
                 actor_loss = actor_loss + self.policy_smooth_reg_coef * smooth_loss
 

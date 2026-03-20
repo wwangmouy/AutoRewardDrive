@@ -270,6 +270,7 @@ class CarlaRouteEnv(gym.Env):
 
         self.terminal_state = False  # Set to True when we want to end episode
         self.success_state = False  # Set to True when we want to end episode.
+        self.terminal_reason = "Running..."
         self.collision_state = False
         self._history_queue.clear()
         self.world.world = None
@@ -299,6 +300,16 @@ class CarlaRouteEnv(gym.Env):
         time.sleep(0.2)
 
         return obs
+
+    def _set_terminal_state(self, reason):
+        if not self.success_state and not self.terminal_state:
+            self.terminal_state = True
+            self.terminal_reason = reason
+
+    def _set_success_state(self, reason="Reached destination"):
+        if not self.terminal_state and not self.success_state:
+            self.success_state = True
+            self.terminal_reason = reason
 
     def new_route(self):
         if self.activate_traffic_flow:
@@ -426,12 +437,6 @@ class CarlaRouteEnv(gym.Env):
             raise Exception("CarlaEnv.step() called after the environment was closed." +
                             "Check for info[\"closed\"] == True in the learning loop.")
         if action is not None:
-            if self.current_waypoint_index >= len(self.route_waypoints) - 1:
-                if not self.eval:
-                    self.new_route()
-                else:
-                    self.success_state = True
-
             if self.action_space_type == "continuous":
                 steer, throttle = [float(a) for a in action]
             elif self.action_space_type == "discrete":
@@ -481,11 +486,17 @@ class CarlaRouteEnv(gym.Env):
         if self.current_waypoint_index < len(self.route_waypoints) - 1:
             self.next_waypoint, self.next_road_maneuver = self.route_waypoints[
                 (self.current_waypoint_index + 1) % len(self.route_waypoints)]
+        else:
+            self.next_waypoint, self.next_road_maneuver = self.route_waypoints[
+                self.current_waypoint_index % len(self.route_waypoints)]
 
         self.current_waypoint, self.current_road_maneuver = self.route_waypoints[
             self.current_waypoint_index % len(self.route_waypoints)]
         self.routes_completed = self.num_routes_completed + (self.current_waypoint_index + 1) / len(
             self.route_waypoints)
+
+        if action is not None and self.current_waypoint_index >= len(self.route_waypoints) - 1:
+            self._set_success_state("Reached destination")
 
         self.distance_from_center = distance_to_line(vector(self.current_waypoint.transform.location),
                                                      vector(self.next_waypoint.transform.location),
@@ -499,19 +510,21 @@ class CarlaRouteEnv(gym.Env):
         self.speed_accum += self.vehicle.get_speed()
         
         # Low speed timeout: terminate if vehicle is stuck (speed < 3 km/h for too long)
-        # 300 frames @ 15 fps = 20 seconds (allows time for waiting behind other vehicles)
+        # 100 frames @ 15 fps ~= 6.7 seconds
         # Only applies during training, not evaluation
         current_speed = self.vehicle.get_speed()
         if current_speed < 3.0:  # Less than 3 km/h
             self.low_speed_timer += 1
-            if self.low_speed_timer >= 100 and not self.eval:  # 20 seconds at 25 fps
-                self.terminal_state = True
-                print(f"{self.episode_idx}| Terminal:  Vehicle stopped")
+            if self.low_speed_timer >= 100 and not self.eval:
+                self._set_terminal_state("Vehicle stopped")
         else:
             self.low_speed_timer = 0  # Reset timer when moving
 
-        if self.distance_traveled >= self.max_distance and not self.eval:
-            self.success_state = True
+        if not self.eval:
+            if self.distance_from_center > CONFIG.reward_params.max_distance:
+                self._set_terminal_state("Off-track")
+            if CONFIG.reward_params.max_speed > 0 and current_speed > CONFIG.reward_params.max_speed:
+                self._set_terminal_state("Too fast")
 
         self.distance_from_center_history.append(self.distance_from_center)
 
@@ -526,7 +539,11 @@ class CarlaRouteEnv(gym.Env):
             pygame.event.pump()
             if pygame.key.get_pressed()[K_ESCAPE]:
                 self.close()
-                self.terminal_state = True
+                self._set_terminal_state("Closed")
+            self.extra_info.extend([
+                self.terminal_reason,
+                ""
+            ])
             self.render()
 
         max_distance = CONFIG.reward_params.max_distance
@@ -560,6 +577,10 @@ class CarlaRouteEnv(gym.Env):
             'avg_center_dev': (self.center_lane_deviation / self.step_count),
             'avg_speed': (self.speed_accum / self.step_count),
             'mean_reward': (self.total_reward / self.step_count),
+            'ground_truth_reward': self.last_reward,
+            'terminal_reason': self.terminal_reason,
+            'terminal_state': self.terminal_state,
+            'success_state': self.success_state,
             'render_array': self.bev_data,
             "centering_factor": centering_factor,
             "angle_factor": angle_factor,
@@ -665,7 +686,7 @@ class CarlaRouteEnv(gym.Env):
 
     def _on_collision(self, event):
         if get_actor_display_name(event.other_actor) != "Road":
-            self.terminal_state = True
+            self._set_terminal_state("Collision with {}".format(event.other_actor.type_id))
             self.collision_state = True
             print("0| Terminal:  Collision with {}".format(event.other_actor.type_id))
         if self.activate_render:

@@ -226,9 +226,10 @@ _CONFIG_3 = {
     "reward_buffer_size": 100,  # Max number of trajectories in meta-learning buffer
     "policy_smooth_reg": {
         "enabled": True,
-        "coef": 0.08,
-        "dims": "all",
+        "coef": 0.01,
+        "dims": "steer",
         "source": "recent_rollout",
+        "start_after_timesteps": 100000,
     },
 }
 
