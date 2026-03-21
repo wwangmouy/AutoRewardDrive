@@ -11,6 +11,7 @@ import random
 from config import CONFIG
 
 from carla_env.tools.hud import HUD
+from carla_env.navigation.controller import VehiclePIDController
 from carla_env.navigation.planner import RoadOption, compute_route_waypoints
 from carla_env.wrappers import *
 
@@ -178,6 +179,7 @@ class CarlaRouteEnv(gym.Env):
         self.last_collision_step = 0
         self.collision_deque = deque(maxlen=100)
         self.total_steps = 0
+        self.expert_controller = None
 
         # bev parameters
         self.use_seg_bev = True if activate_seg_bev else False
@@ -296,6 +298,11 @@ class CarlaRouteEnv(gym.Env):
         self.low_speed_timer = 0.0
         self.collision = False
         self.action_list = []
+        self.expert_controller = VehiclePIDController(
+            self.vehicle,
+            args_lateral={'K_P': 1.6, 'K_D': 0.05, 'K_I': 0.2, 'dt': 1.0 / self.fps},
+            args_longitudinal={'K_P': 0.8, 'K_D': 0.0, 'K_I': 0.15, 'dt': 1.0 / self.fps},
+        )
         self.world.tick()
 
         time.sleep(0.2)
@@ -326,40 +333,41 @@ class CarlaRouteEnv(gym.Env):
         return 0.0
 
     def get_expert_action(self):
-        """Return a lightweight route-following expert action [steer, throttle]."""
-        if not hasattr(self, "current_waypoint") or not hasattr(self, "next_waypoint"):
+        """Return a planner/PID-based route-following expert action [steer, throttle_or_brake]."""
+        if (
+            self.expert_controller is None
+            or not hasattr(self, "current_waypoint")
+            or not hasattr(self, "next_waypoint")
+            or not hasattr(self, "route_waypoints")
+        ):
             return np.array([0.0, 0.2], dtype=np.float32)
 
-        transform = self.vehicle.get_transform()
-        target_loc = self.next_waypoint.transform.location
-        ego_loc = transform.location
-
-        ego_yaw = np.deg2rad(transform.rotation.yaw)
-        heading = np.array([np.cos(ego_yaw), np.sin(ego_yaw)], dtype=np.float32)
-        target_vec = np.array([target_loc.x - ego_loc.x, target_loc.y - ego_loc.y], dtype=np.float32)
-
-        norm = np.linalg.norm(target_vec)
-        if norm < 1e-4:
-            target_dir = heading
-        else:
-            target_dir = target_vec / norm
-
-        dot = float(np.clip(np.dot(heading, target_dir), -1.0, 1.0))
-        cross = float(heading[0] * target_dir[1] - heading[1] * target_dir[0])
-        heading_error = float(np.arctan2(cross, dot))
-
-        steer = float(np.clip(1.35 * heading_error, -1.0, 1.0))
-
         speed = self.vehicle.get_speed()
-        target_speed = 24.0
-        if abs(heading_error) > 0.35:
-            target_speed = 16.0
-        if abs(heading_error) > 0.65:
-            target_speed = 10.0
+        lookahead = 4
+        if speed > 12.0:
+            lookahead = 6
+        if speed > 20.0:
+            lookahead = 8
 
-        speed_error = target_speed - speed
-        throttle = float(np.clip(0.06 * speed_error, -0.5, 0.75))
-        return np.array([steer, throttle], dtype=np.float32)
+        target_idx = min(self.current_waypoint_index + lookahead, len(self.route_waypoints) - 1)
+        target_waypoint = self.route_waypoints[target_idx][0]
+
+        heading_error = abs(self.vehicle.get_angle(target_waypoint))
+        target_speed = 24.0
+        if heading_error > np.deg2rad(15.0):
+            target_speed = 18.0
+        if heading_error > np.deg2rad(30.0):
+            target_speed = 12.0
+
+        control = self.expert_controller.run_step(target_speed, target_waypoint)
+        steer = float(np.clip(control.steer, -1.0, 1.0))
+
+        if speed > target_speed + 2.0:
+            throttle_or_brake = -float(np.clip((speed - target_speed) / 20.0, 0.0, 0.5))
+        else:
+            throttle_or_brake = float(np.clip(control.throttle, 0.0, 0.75))
+
+        return np.array([steer, throttle_or_brake], dtype=np.float32)
 
     def _set_terminal_state(self, reason):
         if not self.success_state and not self.terminal_state:

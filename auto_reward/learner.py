@@ -48,6 +48,8 @@ class AutoRewardLearner:
 
         self.D_xi = deque(maxlen=self.reward_buffer_size)
         self.trajectory_outcomes = deque(maxlen=self.reward_buffer_size)
+        self.total_success_trajectories_seen = 0
+        self.total_failure_trajectories_seen = 0
         self.current_episode_data = []
 
     @property
@@ -60,8 +62,8 @@ class AutoRewardLearner:
 
     def has_bootstrap_data(self, min_success_trajectories, min_failure_trajectories):
         return (
-            self.success_traj_count >= min_success_trajectories
-            and self.failure_traj_count >= min_failure_trajectories
+            self.total_success_trajectories_seen >= min_success_trajectories
+            and self.total_failure_trajectories_seen >= min_failure_trajectories
         )
 
     def get_reward(self, state, action):
@@ -94,6 +96,10 @@ class AutoRewardLearner:
 
         self.D_xi.append(trajectory)
         self.trajectory_outcomes.append(bool(success))
+        if success:
+            self.total_success_trajectories_seen += 1
+        else:
+            self.total_failure_trajectories_seen += 1
         self.current_episode_data = []
 
     def _discounted_cumsum(self, rewards):
@@ -189,4 +195,6 @@ class AutoRewardLearner:
             "gt_vs_learned_return_corr": corr,
             "success_traj_count": self.success_traj_count,
             "failure_traj_count": self.failure_traj_count,
+            "total_success_trajectories_seen": self.total_success_trajectories_seen,
+            "total_failure_trajectories_seen": self.total_failure_trajectories_seen,
         }

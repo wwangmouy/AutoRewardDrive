@@ -232,14 +232,15 @@ _CONFIG_3 = {
             {"episode_end": -1, "min_waypoints": 120, "max_waypoints": None, "tf_num": 20},
         ],
     },
-    "reward_warmstart": {
+    "expert_warmup": {
         "enabled": True,
+        "warmup_steps": 10000,
+        "seed_replay_buffer": True,
+        "update_reward_learner_during_warmup": True,
         "min_success_trajectories": 3,
         "min_failure_trajectories": 10,
+        "latch_ready": True,
     },
-    "expert_bootstrap_steps": 5000,
-    "policy_collect_only_until": 10000,
-    "use_gt_reward_before_warmstart": True,
     "policy_smooth_reg": {
         "enabled": True,
         "coef": 0.01,

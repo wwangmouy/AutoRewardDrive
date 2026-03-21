@@ -55,13 +55,17 @@ class AutoRewardedSAC(SAC):
         self.config = config
         self.reward_update_freq = config.get('reward_update_freq', 2048)
         self.auto_reward_learner = None
-        warmstart_cfg = config.get("reward_warmstart", {})
-        self.reward_warmstart_enabled = bool(warmstart_cfg.get("enabled", False))
-        self.reward_warmstart_min_success = int(warmstart_cfg.get("min_success_trajectories", 0))
-        self.reward_warmstart_min_failure = int(warmstart_cfg.get("min_failure_trajectories", 0))
-        self.expert_bootstrap_steps = int(config.get("expert_bootstrap_steps", 0))
-        self.policy_collect_only_until = int(config.get("policy_collect_only_until", learning_starts))
-        self.use_gt_reward_before_warmstart = bool(config.get("use_gt_reward_before_warmstart", False))
+        warmup_cfg = config.get("expert_warmup", {})
+        self.expert_warmup_enabled = bool(warmup_cfg.get("enabled", False))
+        self.expert_warmup_steps = int(warmup_cfg.get("warmup_steps", 0))
+        self.seed_replay_buffer_from_warmup = bool(warmup_cfg.get("seed_replay_buffer", False))
+        self.update_reward_learner_during_warmup = bool(warmup_cfg.get("update_reward_learner_during_warmup", False))
+        self.warmup_min_success = int(warmup_cfg.get("min_success_trajectories", 0))
+        self.warmup_min_failure = int(warmup_cfg.get("min_failure_trajectories", 0))
+        self.warmup_latch_ready = bool(warmup_cfg.get("latch_ready", False))
+        self._warmstart_ready_latched = False
+        self._warmup_transition_cache: List[Dict[str, Any]] = []
+        self._warmup_cache_seeded = False
         smooth_cfg = config.get("policy_smooth_reg", {})
         self.policy_smooth_reg_enabled = bool(smooth_cfg.get("enabled", False))
         self.policy_smooth_reg_coef = float(smooth_cfg.get("coef", 0.0))
@@ -270,12 +274,95 @@ class AutoRewardedSAC(SAC):
         return smooth_loss, metrics
 
     def _is_reward_warmstart_ready(self) -> bool:
-        if not self.reward_warmstart_enabled or self.auto_reward_learner is None:
+        if not self.expert_warmup_enabled or self.auto_reward_learner is None:
             return True
-        return self.auto_reward_learner.has_bootstrap_data(
-            self.reward_warmstart_min_success,
-            self.reward_warmstart_min_failure,
+        if self._warmstart_ready_latched:
+            return True
+
+        ready = self.auto_reward_learner.has_bootstrap_data(
+            self.warmup_min_success,
+            self.warmup_min_failure,
         )
+        if ready and self.warmup_latch_ready:
+            self._warmstart_ready_latched = True
+        return ready
+
+    def _in_expert_warmup_phase(self) -> bool:
+        return self.expert_warmup_enabled and self.num_timesteps < self.expert_warmup_steps
+
+    def _cache_warmup_transition(self, obs, next_obs, action_np, done, info):
+        self._warmup_transition_cache.append(
+            {
+                "obs": self._clone_observation(obs),
+                "next_obs": self._clone_observation(next_obs),
+                "action": np.array(action_np, copy=True),
+                "done": np.array(done, copy=True),
+                "info": deepcopy(info),
+            }
+        )
+
+    def _compute_learned_reward_from_obs_action(self, obs: Any, action_np: np.ndarray) -> np.ndarray:
+        with torch.no_grad():
+            obs_tensor, _ = self.policy.obs_to_tensor(obs)
+            features = self.actor.extract_features(obs_tensor, self.actor.features_extractor)
+            action_tensor = torch.as_tensor(action_np, device=self.device).float()
+            if action_tensor.ndim == 1:
+                action_tensor = action_tensor.unsqueeze(0)
+            reward = self.auto_reward_learner.get_reward(features, action_tensor)
+            return reward.cpu(memory_format=torch.contiguous_format).numpy().flatten().astype(np.float32)
+
+    def _flush_warmup_cache_to_replay(self):
+        if self._warmup_cache_seeded or not self.seed_replay_buffer_from_warmup:
+            return
+        if len(self._warmup_transition_cache) == 0:
+            self._warmup_cache_seeded = True
+            return
+
+        for transition in self._warmup_transition_cache:
+            learned_reward = self._compute_learned_reward_from_obs_action(
+                transition["obs"], transition["action"]
+            )
+            self.replay_buffer.add(
+                transition["obs"],
+                transition["next_obs"],
+                transition["action"],
+                learned_reward,
+                transition["done"],
+                transition["info"],
+            )
+
+        self._warmup_transition_cache = []
+        self._warmup_cache_seeded = True
+
+    def _log_phase_flags(self, warmup_phase: bool, policy_train_enabled: bool, reward_train_enabled: bool) -> None:
+        self.logger.record("autoreward/warmup_phase", float(warmup_phase))
+        self.logger.record("autoreward/policy_train_enabled", float(policy_train_enabled))
+        self.logger.record("autoreward/reward_train_enabled", float(reward_train_enabled))
+        self.logger.record("autoreward/warmstart_ready", float(self._is_reward_warmstart_ready()))
+        self.logger.record("autoreward/success_traj_count", self.auto_reward_learner.success_traj_count)
+        self.logger.record("autoreward/failure_traj_count", self.auto_reward_learner.failure_traj_count)
+        self.logger.record("autoreward/total_success_traj_seen", self.auto_reward_learner.total_success_trajectories_seen)
+        self.logger.record("autoreward/total_failure_traj_seen", self.auto_reward_learner.total_failure_trajectories_seen)
+
+    def _maybe_update_reward_learner(self) -> None:
+        if self.auto_reward_learner is None:
+            return
+        if self.num_timesteps <= self.learning_starts:
+            return
+        if self.num_timesteps % self.reward_update_freq != 0:
+            return
+
+        metrics = self.auto_reward_learner.optimize_reward()
+        if metrics:
+            self.logger.record("autoreward/meta_loss", metrics.get("meta_loss", 0.0))
+            self.logger.record("autoreward/value_loss", metrics.get("value_loss", 0.0))
+            self.logger.record("autoreward/mean_R", metrics.get("mean_R_omega", 0.0))
+            self.logger.record("autoreward/mean_Adv", metrics.get("mean_Advantage", 0.0))
+            self.logger.record("autoreward/gt_vs_learned_return_corr", metrics.get("gt_vs_learned_return_corr", 0.0))
+            self.logger.record("autoreward/success_traj_count", metrics.get("success_traj_count", 0.0))
+            self.logger.record("autoreward/failure_traj_count", metrics.get("failure_traj_count", 0.0))
+            self.logger.record("autoreward/total_success_traj_seen", metrics.get("total_success_trajectories_seen", 0.0))
+            self.logger.record("autoreward/total_failure_traj_seen", metrics.get("total_failure_trajectories_seen", 0.0))
 
     @staticmethod
     def _unwrap_single_env(vec_env: VecEnv) -> Optional[Any]:
@@ -330,7 +417,8 @@ class AutoRewardedSAC(SAC):
             if self.use_sde:
                 self.actor.reset_noise(env.num_envs)
 
-            use_expert_policy = self.num_timesteps < self.expert_bootstrap_steps
+            warmup_phase = self._in_expert_warmup_phase()
+            use_expert_policy = warmup_phase
             expert_actions_np = self._query_expert_action(env) if use_expert_policy else None
 
             with torch.no_grad():
@@ -361,14 +449,15 @@ class AutoRewardedSAC(SAC):
             gt_reward = float(rewards[0])
             learned_reward = float(r_omega_val[0])
             warmstart_ready = self._is_reward_warmstart_ready()
-            use_gt_reward_for_training = self.use_gt_reward_before_warmstart and not warmstart_ready
-            train_reward = gt_reward if use_gt_reward_for_training else learned_reward
-            train_reward_array = np.array([train_reward], dtype=np.float32)
+            train_reward_array = np.array([learned_reward], dtype=np.float32)
             infos[0]["ground_truth_reward"] = gt_reward
             infos[0]["learned_reward"] = learned_reward
-            infos[0]["train_reward"] = train_reward
+            infos[0]["train_reward"] = learned_reward
             infos[0]["warmstart_ready"] = warmstart_ready
-            infos[0]["expert_bootstrap_active"] = float(expert_actions_np is not None)
+            infos[0]["warmup_phase"] = float(warmup_phase)
+            infos[0]["policy_train_enabled"] = float(not warmup_phase)
+            infos[0]["reward_train_enabled"] = float((not warmup_phase) or self.update_reward_learner_during_warmup)
+            infos[0]["expert_bootstrap_active"] = float(use_expert_policy)
             
             # Store for meta-learning (ground truth reward)
             self.auto_reward_learner.store_transition(
@@ -396,22 +485,33 @@ class AutoRewardedSAC(SAC):
                         num_collected_episodes += 1
                         self._episode_num += 1
             
-            # Store with GT/learned bootstrap reward
-            self.replay_buffer.add(self._last_obs, real_next_obs, actions_np, train_reward_array, dones, infos)
+            if warmup_phase:
+                self._cache_warmup_transition(self._last_obs, real_next_obs, actions_np, dones, infos)
+            else:
+                if self.seed_replay_buffer_from_warmup and not self._warmup_cache_seeded:
+                    self._flush_warmup_cache_to_replay()
+                self.replay_buffer.add(self._last_obs, real_next_obs, actions_np, train_reward_array, dones, infos)
             self._last_obs = new_obs
+            if self.seed_replay_buffer_from_warmup and not self._warmup_cache_seeded and self.num_timesteps >= self.expert_warmup_steps:
+                self._flush_warmup_cache_to_replay()
             
             # Update callback locals for TensorboardCallback
             self._update_info_buffer(infos, dones)
             callback.update_locals(locals())
             
+            if warmup_phase and self.update_reward_learner_during_warmup:
+                self._maybe_update_reward_learner()
+
             if callback.on_step() is False:
                 self._finalize_smooth_episode()
                 return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
         
         self._finalize_smooth_episode()
-        self.logger.record("autoreward/warmstart_ready", float(self._is_reward_warmstart_ready()))
-        self.logger.record("autoreward/success_traj_count", self.auto_reward_learner.success_traj_count)
-        self.logger.record("autoreward/failure_traj_count", self.auto_reward_learner.failure_traj_count)
+        self._log_phase_flags(
+            warmup_phase=self._in_expert_warmup_phase(),
+            policy_train_enabled=not self._in_expert_warmup_phase(),
+            reward_train_enabled=(not self._in_expert_warmup_phase()) or self.update_reward_learner_during_warmup,
+        )
         callback.on_rollout_end()
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=True)
 
@@ -419,12 +519,22 @@ class AutoRewardedSAC(SAC):
         """Train SAC with action smoothness regularization and periodic meta-gradient updates."""
         self.policy.set_training_mode(True)
 
-        if self.num_timesteps < self.policy_collect_only_until:
-            self.logger.record("autoreward/collect_only_phase", 1.0)
-            self.logger.record("autoreward/train_enabled", 0.0)
+        if self._in_expert_warmup_phase():
+            self._log_phase_flags(
+                warmup_phase=True,
+                policy_train_enabled=False,
+                reward_train_enabled=self.update_reward_learner_during_warmup,
+            )
             return
-        self.logger.record("autoreward/collect_only_phase", 0.0)
-        self.logger.record("autoreward/train_enabled", 1.0)
+
+        if self.seed_replay_buffer_from_warmup and not self._warmup_cache_seeded:
+            self._flush_warmup_cache_to_replay()
+
+        self._log_phase_flags(
+            warmup_phase=False,
+            policy_train_enabled=True,
+            reward_train_enabled=True,
+        )
 
         optimizers = [self.actor.optimizer, self.critic.optimizer]
         if self.ent_coef_optimizer is not None:
@@ -437,17 +547,6 @@ class AutoRewardedSAC(SAC):
         mean_action_deltas = []
         mean_steer_deltas = []
         mean_throttle_deltas = []
-        warmstart_ready = self._is_reward_warmstart_ready()
-
-        if not warmstart_ready:
-            self.logger.record("autoreward/warmstart_ready", 0.0)
-            self.logger.record("autoreward/success_traj_count", self.auto_reward_learner.success_traj_count)
-            self.logger.record("autoreward/failure_traj_count", self.auto_reward_learner.failure_traj_count)
-            self.logger.record("smooth/actor_smooth_loss", 0.0)
-            self.logger.record("smooth/mean_action_delta", 0.0)
-            self.logger.record("smooth/mean_steer_delta", 0.0)
-            self.logger.record("smooth/mean_throttle_delta", 0.0)
-            return
 
         for gradient_step in range(gradient_steps):
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
@@ -525,44 +624,8 @@ class AutoRewardedSAC(SAC):
         self.logger.record("smooth/mean_action_delta", np.mean(mean_action_deltas) if mean_action_deltas else 0.0)
         self.logger.record("smooth/mean_steer_delta", np.mean(mean_steer_deltas) if mean_steer_deltas else 0.0)
         self.logger.record("smooth/mean_throttle_delta", np.mean(mean_throttle_deltas) if mean_throttle_deltas else 0.0)
-        self.logger.record("autoreward/warmstart_ready", 1.0)
-        self.logger.record("autoreward/success_traj_count", self.auto_reward_learner.success_traj_count)
-        self.logger.record("autoreward/failure_traj_count", self.auto_reward_learner.failure_traj_count)
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
-        
-        def sample_action_from_mu(mu_batch, n_samples):
-            """Resample actions from policy distribution."""
-            mean, log_std = mu_batch
-            mean, log_std = mean.to(self.device), log_std.to(self.device)
-            std = log_std.exp()
-            normal = torch.distributions.Normal(mean, std)
-            
-            # Get action bounds from action_space
-            action_low = torch.tensor(self.action_space.low, device=self.device).float()
-            action_high = torch.tensor(self.action_space.high, device=self.device).float()
-            action_scale = (action_high - action_low) / 2.0
-            action_bias = (action_high + action_low) / 2.0
-            
-            x_t = normal.rsample((n_samples,))
-            y_t = torch.tanh(x_t)
-            action = y_t * action_scale + action_bias
-            
-            log_prob = normal.log_prob(x_t)
-            log_prob -= torch.log(action_scale * (1 - y_t.pow(2)) + 1e-6)
-            log_prob = log_prob.sum(dim=-1, keepdim=True)
-            
-            return action, log_prob
 
         # Meta-update at specified frequency
-        if self.num_timesteps > self.learning_starts and self.num_timesteps % self.reward_update_freq < gradient_steps:
-            metrics = self.auto_reward_learner.optimize_reward(sample_action_from_mu)
-            
-            if metrics:
-                self.logger.record("autoreward/meta_loss", metrics.get("meta_loss", 0.0))
-                self.logger.record("autoreward/value_loss", metrics.get("value_loss", 0.0))
-                self.logger.record("autoreward/mean_R", metrics.get("mean_R_omega", 0.0))
-                self.logger.record("autoreward/mean_Adv", metrics.get("mean_Advantage", 0.0))
-                self.logger.record("autoreward/gt_vs_learned_return_corr", metrics.get("gt_vs_learned_return_corr", 0.0))
-                self.logger.record("autoreward/success_traj_count", metrics.get("success_traj_count", 0.0))
-                self.logger.record("autoreward/failure_traj_count", metrics.get("failure_traj_count", 0.0))
+        self._maybe_update_reward_learner()
