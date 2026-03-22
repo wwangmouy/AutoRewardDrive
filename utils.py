@@ -140,8 +140,16 @@ class TensorboardCallback(BaseCallback):
                 self.logger.record("autoreward/trajectory_buffer_size", len(learner.D_xi))
                 self.logger.record("autoreward/success_traj_count", learner.success_traj_count)
                 self.logger.record("autoreward/failure_traj_count", learner.failure_traj_count)
+                self.logger.record("autoreward/total_success_traj_seen", learner.total_success_trajectories_seen)
+                self.logger.record("autoreward/total_failure_traj_seen", learner.total_failure_trajectories_seen)
                 if 'warmstart_ready' in self.locals['infos'][0]:
                     self.logger.record("autoreward/warmstart_ready", float(self.locals['infos'][0]['warmstart_ready']))
+                if 'warmup_phase' in self.locals['infos'][0]:
+                    self.logger.record("autoreward/warmup_phase", float(self.locals['infos'][0]['warmup_phase']))
+                if 'policy_train_enabled' in self.locals['infos'][0]:
+                    self.logger.record("autoreward/policy_train_enabled", float(self.locals['infos'][0]['policy_train_enabled']))
+                if 'reward_train_enabled' in self.locals['infos'][0]:
+                    self.logger.record("autoreward/reward_train_enabled", float(self.locals['infos'][0]['reward_train_enabled']))
                 
                 # Episode-level reward comparison
                 if self.episode_learned_rewards:

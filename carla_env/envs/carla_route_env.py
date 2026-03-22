@@ -180,6 +180,7 @@ class CarlaRouteEnv(gym.Env):
         self.collision_deque = deque(maxlen=100)
         self.total_steps = 0
         self.expert_controller = None
+        self.sensor_wait_timeout = 5.0
 
         # bev parameters
         self.use_seg_bev = True if activate_seg_bev else False
@@ -752,29 +753,41 @@ class CarlaRouteEnv(gym.Env):
         return image
 
     def _get_observation(self):
+        start = time.time()
         while self.observation_buffer is None:
-            pass
+            if time.time() - start > self.sensor_wait_timeout:
+                raise TimeoutError("Timed out waiting for observation_buffer")
+            time.sleep(0.001)
         obs = self.observation_buffer.copy()
         self.observation_buffer = None
         return obs
 
     def _get_viewer_image(self):
+        start = time.time()
         while self.viewer_image_buffer is None:
-            pass
+            if time.time() - start > self.sensor_wait_timeout:
+                raise TimeoutError("Timed out waiting for viewer_image_buffer")
+            time.sleep(0.001)
         image = self.viewer_image_buffer.copy()
         self.viewer_image_buffer = None
         return image
 
     def _get_bev_spectator_data(self):
+        start = time.time()
         while self.bev_spectator_data_buffer is None:
-            pass
+            if time.time() - start > self.sensor_wait_timeout:
+                raise TimeoutError("Timed out waiting for bev_spectator_data_buffer")
+            time.sleep(0.001)
         image = self.bev_spectator_data_buffer.copy()
         self.bev_spectator_data_buffer = None
         return image
 
     def _get_bev_data(self):
+        start = time.time()
         while self.bev_data_buffer is None:
-            pass
+            if time.time() - start > self.sensor_wait_timeout:
+                raise TimeoutError("Timed out waiting for bev_data_buffer")
+            time.sleep(0.001)
         image = self.bev_data_buffer.copy()
         self.bev_data_buffer = None
         return image

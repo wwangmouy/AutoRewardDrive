@@ -64,8 +64,8 @@ class AutoRewardedSAC(SAC):
         self.warmup_min_failure = int(warmup_cfg.get("min_failure_trajectories", 0))
         self.warmup_latch_ready = bool(warmup_cfg.get("latch_ready", False))
         self._warmstart_ready_latched = False
-        self._warmup_transition_cache: List[Dict[str, Any]] = []
-        self._warmup_cache_seeded = False
+        self._warmup_replay_indices: List[int] = []
+        self._warmup_rewards_refreshed = False
         smooth_cfg = config.get("policy_smooth_reg", {})
         self.policy_smooth_reg_enabled = bool(smooth_cfg.get("enabled", False))
         self.policy_smooth_reg_coef = float(smooth_cfg.get("coef", 0.0))
@@ -290,17 +290,6 @@ class AutoRewardedSAC(SAC):
     def _in_expert_warmup_phase(self) -> bool:
         return self.expert_warmup_enabled and self.num_timesteps < self.expert_warmup_steps
 
-    def _cache_warmup_transition(self, obs, next_obs, action_np, done, info):
-        self._warmup_transition_cache.append(
-            {
-                "obs": self._clone_observation(obs),
-                "next_obs": self._clone_observation(next_obs),
-                "action": np.array(action_np, copy=True),
-                "done": np.array(done, copy=True),
-                "info": deepcopy(info),
-            }
-        )
-
     def _compute_learned_reward_from_obs_action(self, obs: Any, action_np: np.ndarray) -> np.ndarray:
         with torch.no_grad():
             obs_tensor, _ = self.policy.obs_to_tensor(obs)
@@ -311,28 +300,45 @@ class AutoRewardedSAC(SAC):
             reward = self.auto_reward_learner.get_reward(features, action_tensor)
             return reward.cpu(memory_format=torch.contiguous_format).numpy().flatten().astype(np.float32)
 
-    def _flush_warmup_cache_to_replay(self):
-        if self._warmup_cache_seeded or not self.seed_replay_buffer_from_warmup:
+    def _add_transition_to_replay(self, obs, next_obs, action_np, reward_array, done, info, track_warmup=False):
+        replay_index = int(getattr(self.replay_buffer, "pos", 0))
+        self.replay_buffer.add(obs, next_obs, action_np, reward_array, done, info)
+        if track_warmup:
+            self._warmup_replay_indices.append(replay_index)
+
+    def _replay_obs_at(self, index: int) -> Any:
+        obs_store = self.replay_buffer.observations
+        if isinstance(obs_store, dict):
+            return {key: np.array(value[index], copy=True) for key, value in obs_store.items()}
+        return np.array(obs_store[index], copy=True)
+
+    def _replay_action_at(self, index: int) -> np.ndarray:
+        action = np.array(self.replay_buffer.actions[index], copy=True)
+        if action.ndim == 1:
+            action = action.reshape(1, -1)
+        return action
+
+    def _refresh_warmup_replay_rewards(self):
+        if self._warmup_rewards_refreshed:
             return
-        if len(self._warmup_transition_cache) == 0:
-            self._warmup_cache_seeded = True
+        if not self.seed_replay_buffer_from_warmup:
+            self._warmup_replay_indices = []
+            self._warmup_rewards_refreshed = True
+            return
+        if len(self._warmup_replay_indices) == 0:
+            self._warmup_rewards_refreshed = True
             return
 
-        for transition in self._warmup_transition_cache:
+        for index in self._warmup_replay_indices:
             learned_reward = self._compute_learned_reward_from_obs_action(
-                transition["obs"], transition["action"]
+                self._replay_obs_at(index),
+                self._replay_action_at(index),
             )
-            self.replay_buffer.add(
-                transition["obs"],
-                transition["next_obs"],
-                transition["action"],
-                learned_reward,
-                transition["done"],
-                transition["info"],
-            )
+            reward_slot = self.replay_buffer.rewards[index]
+            self.replay_buffer.rewards[index] = learned_reward.reshape(reward_slot.shape)
 
-        self._warmup_transition_cache = []
-        self._warmup_cache_seeded = True
+        self._warmup_replay_indices = []
+        self._warmup_rewards_refreshed = True
 
     def _log_phase_flags(self, warmup_phase: bool, policy_train_enabled: bool, reward_train_enabled: bool) -> None:
         self.logger.record("autoreward/warmup_phase", float(warmup_phase))
@@ -344,10 +350,10 @@ class AutoRewardedSAC(SAC):
         self.logger.record("autoreward/total_success_traj_seen", self.auto_reward_learner.total_success_trajectories_seen)
         self.logger.record("autoreward/total_failure_traj_seen", self.auto_reward_learner.total_failure_trajectories_seen)
 
-    def _maybe_update_reward_learner(self) -> None:
+    def _maybe_update_reward_learner(self, allow_before_learning_starts: bool = False) -> None:
         if self.auto_reward_learner is None:
             return
-        if self.num_timesteps <= self.learning_starts:
+        if not allow_before_learning_starts and self.num_timesteps <= self.learning_starts:
             return
         if self.num_timesteps % self.reward_update_freq != 0:
             return
@@ -486,21 +492,37 @@ class AutoRewardedSAC(SAC):
                         self._episode_num += 1
             
             if warmup_phase:
-                self._cache_warmup_transition(self._last_obs, real_next_obs, actions_np, dones, infos)
+                self._add_transition_to_replay(
+                    self._last_obs,
+                    real_next_obs,
+                    actions_np,
+                    train_reward_array,
+                    dones,
+                    infos,
+                    track_warmup=self.seed_replay_buffer_from_warmup,
+                )
             else:
-                if self.seed_replay_buffer_from_warmup and not self._warmup_cache_seeded:
-                    self._flush_warmup_cache_to_replay()
-                self.replay_buffer.add(self._last_obs, real_next_obs, actions_np, train_reward_array, dones, infos)
+                if self.seed_replay_buffer_from_warmup and not self._warmup_rewards_refreshed:
+                    self._refresh_warmup_replay_rewards()
+                self._add_transition_to_replay(
+                    self._last_obs,
+                    real_next_obs,
+                    actions_np,
+                    train_reward_array,
+                    dones,
+                    infos,
+                    track_warmup=False,
+                )
             self._last_obs = new_obs
-            if self.seed_replay_buffer_from_warmup and not self._warmup_cache_seeded and self.num_timesteps >= self.expert_warmup_steps:
-                self._flush_warmup_cache_to_replay()
+            if self.seed_replay_buffer_from_warmup and not self._warmup_rewards_refreshed and self.num_timesteps >= self.expert_warmup_steps:
+                self._refresh_warmup_replay_rewards()
             
             # Update callback locals for TensorboardCallback
             self._update_info_buffer(infos, dones)
             callback.update_locals(locals())
             
             if warmup_phase and self.update_reward_learner_during_warmup:
-                self._maybe_update_reward_learner()
+                self._maybe_update_reward_learner(allow_before_learning_starts=True)
 
             if callback.on_step() is False:
                 self._finalize_smooth_episode()
@@ -527,8 +549,8 @@ class AutoRewardedSAC(SAC):
             )
             return
 
-        if self.seed_replay_buffer_from_warmup and not self._warmup_cache_seeded:
-            self._flush_warmup_cache_to_replay()
+        if self.seed_replay_buffer_from_warmup and not self._warmup_rewards_refreshed:
+            self._refresh_warmup_replay_rewards()
 
         self._log_phase_flags(
             warmup_phase=False,
