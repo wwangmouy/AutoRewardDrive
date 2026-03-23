@@ -243,6 +243,15 @@ _CONFIG_3 = {
         "dims": "steer",
         "start_after_timesteps": 30000,
     },
+    "reward_objective": {
+        "align_coef": 1.0,
+        "rank_coef": 1.0,
+        "terminal_coef": 0.5,
+        "reg_coef": 1e-4,
+        "rank_margin": 1.0,
+        "terminal_pos_margin": 0.5,
+        "terminal_neg_margin": 0.5,
+    },
     "action_shield": {
         "enabled": True,
         "apply_during_warmup": False,

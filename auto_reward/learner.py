@@ -31,6 +31,14 @@ class AutoRewardLearner:
         self.value_lr = 3e-4
         self.reward_buffer_size = config.get("reward_buffer_size", 100)
         self.trajectory_batch_size = min(16, self.reward_buffer_size)
+        objective_cfg = config.get("reward_objective", {})
+        self.align_coef = float(objective_cfg.get("align_coef", 1.0))
+        self.rank_coef = float(objective_cfg.get("rank_coef", 1.0))
+        self.terminal_coef = float(objective_cfg.get("terminal_coef", 0.5))
+        self.reg_coef = float(objective_cfg.get("reg_coef", 1e-4))
+        self.rank_margin = float(objective_cfg.get("rank_margin", 1.0))
+        self.terminal_pos_margin = float(objective_cfg.get("terminal_pos_margin", 0.5))
+        self.terminal_neg_margin = float(objective_cfg.get("terminal_neg_margin", 0.5))
 
         self.reward_net = RewardNetwork(
             state_dim=state_dim,
@@ -106,9 +114,9 @@ class AutoRewardLearner:
 
     def _sample_trajectories(self):
         if len(self.D_xi) <= self.trajectory_batch_size:
-            return list(self.D_xi)
+            return list(zip(self.D_xi, self.trajectory_outcomes))
         indices = random.sample(range(len(self.D_xi)), self.trajectory_batch_size)
-        return [self.D_xi[idx] for idx in indices]
+        return [(self.D_xi[idx], self.trajectory_outcomes[idx]) for idx in indices]
 
     def optimize_reward(self, agent_policy_func=None):
         if len(self.D_xi) == 0:
@@ -123,8 +131,11 @@ class AutoRewardLearner:
         flat_gt_returns = []
         flat_learned_returns = []
         flat_learned_step_rewards = []
+        trajectory_outcomes = []
+        trajectory_learned_returns = []
+        trajectory_terminal_rewards = []
 
-        for trajectory in sampled_trajectories:
+        for trajectory, success in sampled_trajectories:
             states_np = np.array([step.state for step in trajectory], dtype=np.float32)
             actions_np = np.array([step.action for step in trajectory], dtype=np.float32)
             gt_returns_np = np.array([step.gt_return for step in trajectory], dtype=np.float32)
@@ -141,12 +152,19 @@ class AutoRewardLearner:
             flat_gt_returns.append(gt_returns)
             flat_learned_returns.append(learned_returns)
             flat_learned_step_rewards.append(learned_step_rewards)
+            trajectory_outcomes.append(bool(success))
+            trajectory_learned_returns.append(learned_returns[0])
+            trajectory_terminal_rewards.append(learned_step_rewards[-1])
 
         states_all = torch.cat(flat_states, dim=0)
         actions_all = torch.cat(flat_actions, dim=0)
         gt_returns_all = torch.cat(flat_gt_returns, dim=0)
         learned_returns_all = torch.cat(flat_learned_returns, dim=0)
         learned_step_rewards_all = torch.cat(flat_learned_step_rewards, dim=0)
+        trajectory_learned_returns = torch.stack(trajectory_learned_returns)
+        trajectory_terminal_rewards = torch.stack(trajectory_terminal_rewards)
+        success_mask = torch.tensor(trajectory_outcomes, device=self.device, dtype=torch.bool)
+        failure_mask = ~success_mask
 
         self.gt_value_optimizer.zero_grad()
         gt_value_preds = self.gt_value_net(states_all).squeeze(-1)
@@ -165,8 +183,40 @@ class AutoRewardLearner:
 
         gt_advantage = (gt_returns_all - gt_value_baseline).detach()
         learned_advantage = learned_returns_all - learned_value_baseline
-        alignment = gt_advantage * learned_advantage
-        reward_loss = -alignment.mean()
+        gt_advantage_norm = (gt_advantage - gt_advantage.mean()) / (gt_advantage.std() + 1e-6)
+        learned_advantage_norm = (learned_advantage - learned_advantage.mean()) / (learned_advantage.std() + 1e-6)
+        loss_align = -(gt_advantage_norm * learned_advantage_norm).mean()
+
+        zero = torch.zeros((), device=self.device)
+        loss_rank = zero
+        mean_success_return = None
+        mean_failure_return = None
+        if success_mask.any() and failure_mask.any():
+            mean_success_return = trajectory_learned_returns[success_mask].mean()
+            mean_failure_return = trajectory_learned_returns[failure_mask].mean()
+            loss_rank = F.relu(self.rank_margin - (mean_success_return - mean_failure_return))
+
+        loss_terminal_success = zero
+        loss_terminal_failure = zero
+        mean_success_terminal = None
+        mean_failure_terminal = None
+        if success_mask.any():
+            success_terminal = trajectory_terminal_rewards[success_mask]
+            mean_success_terminal = success_terminal.mean()
+            loss_terminal_success = F.relu(self.terminal_pos_margin - success_terminal).mean()
+        if failure_mask.any():
+            failure_terminal = trajectory_terminal_rewards[failure_mask]
+            mean_failure_terminal = failure_terminal.mean()
+            loss_terminal_failure = F.relu(self.terminal_neg_margin + failure_terminal).mean()
+        loss_terminal = loss_terminal_success + loss_terminal_failure
+
+        loss_reg = (learned_step_rewards_all ** 2).mean()
+        reward_loss = (
+            self.align_coef * loss_align
+            + self.rank_coef * loss_rank
+            + self.terminal_coef * loss_terminal
+            + self.reg_coef * loss_reg
+        )
 
         self.reward_optimizer.zero_grad()
         reward_loss.backward()
@@ -187,6 +237,14 @@ class AutoRewardLearner:
             "mean_R_omega": float(learned_step_rewards_all.detach().mean().item()),
             "mean_Advantage": float(gt_advantage.mean().item()),
             "gt_vs_learned_return_corr": corr,
+            "align_loss": float(loss_align.detach().item()),
+            "rank_loss": float(loss_rank.detach().item()),
+            "terminal_loss": float(loss_terminal.detach().item()),
+            "reward_reg_loss": float(loss_reg.detach().item()),
+            "mean_success_return": float(mean_success_return.detach().item()) if mean_success_return is not None else 0.0,
+            "mean_failure_return": float(mean_failure_return.detach().item()) if mean_failure_return is not None else 0.0,
+            "mean_success_terminal_reward": float(mean_success_terminal.detach().item()) if mean_success_terminal is not None else 0.0,
+            "mean_failure_terminal_reward": float(mean_failure_terminal.detach().item()) if mean_failure_terminal is not None else 0.0,
             "success_traj_count": self.success_traj_count,
             "failure_traj_count": self.failure_traj_count,
             "total_success_trajectories_seen": self.total_success_trajectories_seen,
