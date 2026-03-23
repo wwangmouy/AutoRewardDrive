@@ -12,7 +12,7 @@ parser.add_argument("--model", type=str, default="./model_400000_steps.zip", hel
 parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
 parser.add_argument("--fps", type=int, default=15, help="FPS to render the environment")
 parser.add_argument("--no_record_video", action="store_false", help="If True, record video of the evaluation")
-parser.add_argument("--config", type=str, default="vlm_rl", help="Config to use (default: vlm_rl)")
+parser.add_argument("--config", type=str, default="3", help="Config to use (default: 3)")
 parser.add_argument("--seed", type=int, default=101, help="random seed")
 parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
 parser.add_argument("--density", choices=['empty', 'regular', 'dense'], default="regular",

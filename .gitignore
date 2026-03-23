@@ -1,4 +1,5 @@
 tensorboard/
+log/
 __pycache__/
 *.pyc
 *.pyo

@@ -60,12 +60,6 @@ class AutoRewardLearner:
     def failure_traj_count(self):
         return int(sum(1 for outcome in self.trajectory_outcomes if not outcome))
 
-    def has_bootstrap_data(self, min_success_trajectories, min_failure_trajectories):
-        return (
-            self.total_success_trajectories_seen >= min_success_trajectories
-            and self.total_failure_trajectories_seen >= min_failure_trajectories
-        )
-
     def get_reward(self, state, action):
         with torch.no_grad():
             return self.reward_net(state, action)

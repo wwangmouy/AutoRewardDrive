@@ -127,6 +127,8 @@ class TensorboardCallback(BaseCallback):
             self.logger.record("custom/collision_rate", self.locals['infos'][0]['collision_rate'])
             self.logger.record("custom/collision_num", self.locals['infos'][0]['collision_num'])
             self.logger.record("custom/episode_length", self.locals['infos'][0]['episode_length'])
+            if 'shield_intervention_count' in self.locals['infos'][0]:
+                self.logger.record("shield/episode_intervention_count", self.locals['infos'][0]['shield_intervention_count'])
             if self.locals['infos'][0]['collision_state']:
                 self.logger.record("custom/CPS", self.locals['infos'][0]['CPS'])
                 self.logger.record("custom/CPM", self.locals['infos'][0]['CPM'])
@@ -142,8 +144,6 @@ class TensorboardCallback(BaseCallback):
                 self.logger.record("autoreward/failure_traj_count", learner.failure_traj_count)
                 self.logger.record("autoreward/total_success_traj_seen", learner.total_success_trajectories_seen)
                 self.logger.record("autoreward/total_failure_traj_seen", learner.total_failure_trajectories_seen)
-                if 'warmstart_ready' in self.locals['infos'][0]:
-                    self.logger.record("autoreward/warmstart_ready", float(self.locals['infos'][0]['warmstart_ready']))
                 if 'warmup_phase' in self.locals['infos'][0]:
                     self.logger.record("autoreward/warmup_phase", float(self.locals['infos'][0]['warmup_phase']))
                 if 'policy_train_enabled' in self.locals['infos'][0]:

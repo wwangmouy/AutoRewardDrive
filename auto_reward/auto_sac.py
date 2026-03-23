@@ -60,17 +60,22 @@ class AutoRewardedSAC(SAC):
         self.expert_warmup_steps = int(warmup_cfg.get("warmup_steps", 0))
         self.seed_replay_buffer_from_warmup = bool(warmup_cfg.get("seed_replay_buffer", False))
         self.update_reward_learner_during_warmup = bool(warmup_cfg.get("update_reward_learner_during_warmup", False))
-        self.warmup_min_success = int(warmup_cfg.get("min_success_trajectories", 0))
-        self.warmup_min_failure = int(warmup_cfg.get("min_failure_trajectories", 0))
-        self.warmup_latch_ready = bool(warmup_cfg.get("latch_ready", False))
-        self._warmstart_ready_latched = False
         self._warmup_replay_indices: List[int] = []
         self._warmup_rewards_refreshed = False
+        shield_cfg = config.get("action_shield", {})
+        self.action_shield_enabled = bool(shield_cfg.get("enabled", False))
+        self.action_shield_apply_during_warmup = bool(shield_cfg.get("apply_during_warmup", False))
+        self.action_shield_apply_during_training = bool(shield_cfg.get("apply_during_training", False))
+        self.action_shield_front_distance_threshold = float(shield_cfg.get("front_distance_threshold", 10.0))
+        self.action_shield_front_speed_threshold = float(shield_cfg.get("front_speed_threshold", 5.0))
+        self.action_shield_front_scan_distance = float(shield_cfg.get("front_scan_distance", 25.0))
+        self.action_shield_front_lateral_threshold = float(shield_cfg.get("front_lateral_threshold", 2.5))
+        self.action_shield_lane_deviation_threshold = float(shield_cfg.get("lane_deviation_threshold", 0.8))
+        self.action_shield_brake_strength = float(shield_cfg.get("brake_strength", 0.5))
         smooth_cfg = config.get("policy_smooth_reg", {})
         self.policy_smooth_reg_enabled = bool(smooth_cfg.get("enabled", False))
         self.policy_smooth_reg_coef = float(smooth_cfg.get("coef", 0.0))
         self.policy_smooth_reg_dims = smooth_cfg.get("dims", "all")
-        self.policy_smooth_reg_source = smooth_cfg.get("source", "recent_rollout")
         self.policy_smooth_reg_start_after_timesteps = int(smooth_cfg.get("start_after_timesteps", 0))
         self._smooth_rollout_segments: List[List[Any]] = []
         self._smooth_current_episode_obs: List[Any] = []
@@ -229,7 +234,6 @@ class AutoRewardedSAC(SAC):
         if (
             not self.policy_smooth_reg_enabled
             or self.policy_smooth_reg_coef <= 0.0
-            or self.policy_smooth_reg_source != "recent_rollout"
             or len(self._smooth_rollout_segments) == 0
         ):
             return zero, metrics
@@ -272,20 +276,6 @@ class AutoRewardedSAC(SAC):
             metrics["mean_throttle_delta"] = float(torch.cat(throttle_delta_terms).mean().item())
 
         return smooth_loss, metrics
-
-    def _is_reward_warmstart_ready(self) -> bool:
-        if not self.expert_warmup_enabled or self.auto_reward_learner is None:
-            return True
-        if self._warmstart_ready_latched:
-            return True
-
-        ready = self.auto_reward_learner.has_bootstrap_data(
-            self.warmup_min_success,
-            self.warmup_min_failure,
-        )
-        if ready and self.warmup_latch_ready:
-            self._warmstart_ready_latched = True
-        return ready
 
     def _in_expert_warmup_phase(self) -> bool:
         return self.expert_warmup_enabled and self.num_timesteps < self.expert_warmup_steps
@@ -344,7 +334,6 @@ class AutoRewardedSAC(SAC):
         self.logger.record("autoreward/warmup_phase", float(warmup_phase))
         self.logger.record("autoreward/policy_train_enabled", float(policy_train_enabled))
         self.logger.record("autoreward/reward_train_enabled", float(reward_train_enabled))
-        self.logger.record("autoreward/warmstart_ready", float(self._is_reward_warmstart_ready()))
         self.logger.record("autoreward/success_traj_count", self.auto_reward_learner.success_traj_count)
         self.logger.record("autoreward/failure_traj_count", self.auto_reward_learner.failure_traj_count)
         self.logger.record("autoreward/total_success_traj_seen", self.auto_reward_learner.total_success_trajectories_seen)
@@ -399,6 +388,55 @@ class AutoRewardedSAC(SAC):
         action_np = np.asarray(action, dtype=np.float32).reshape(1, -1)
         return action_np
 
+    def _apply_action_shield(self, vec_env: VecEnv, raw_action_np: np.ndarray, warmup_phase: bool) -> Tuple[np.ndarray, Dict[str, float]]:
+        metrics = {
+            "shield_active": 0.0,
+            "shield_front_brake": 0.0,
+            "shield_steer_clamp": 0.0,
+            "raw_safe_diff_steer": 0.0,
+            "raw_safe_diff_throttle": 0.0,
+        }
+        if not self.action_shield_enabled:
+            return raw_action_np, metrics
+        if warmup_phase and not self.action_shield_apply_during_warmup:
+            return raw_action_np, metrics
+        if (not warmup_phase) and not self.action_shield_apply_during_training:
+            return raw_action_np, metrics
+
+        env = self._unwrap_single_env(vec_env)
+        if env is None or not hasattr(env, "get_safety_signals"):
+            return raw_action_np, metrics
+
+        safety = env.get_safety_signals(
+            front_scan_distance=self.action_shield_front_scan_distance,
+            front_lateral_threshold=self.action_shield_front_lateral_threshold,
+        )
+        safe_action = np.array(raw_action_np, copy=True)
+        raw_steer = float(safe_action[0, 0])
+        raw_throttle = float(safe_action[0, 1])
+
+        if (
+            safety["front_vehicle_distance"] < self.action_shield_front_distance_threshold
+            and safety["speed"] > self.action_shield_front_speed_threshold
+        ):
+            safe_action[0, 1] = min(raw_throttle, -self.action_shield_brake_strength)
+            metrics["shield_active"] = 1.0
+            metrics["shield_front_brake"] = 1.0
+
+        lateral_error = float(safety["signed_lateral_error"])
+        if lateral_error > self.action_shield_lane_deviation_threshold and raw_steer > 0.0:
+            safe_action[0, 0] = 0.0
+            metrics["shield_active"] = 1.0
+            metrics["shield_steer_clamp"] = 1.0
+        elif lateral_error < -self.action_shield_lane_deviation_threshold and raw_steer < 0.0:
+            safe_action[0, 0] = 0.0
+            metrics["shield_active"] = 1.0
+            metrics["shield_steer_clamp"] = 1.0
+
+        metrics["raw_safe_diff_steer"] = abs(float(safe_action[0, 0]) - raw_steer)
+        metrics["raw_safe_diff_throttle"] = abs(float(safe_action[0, 1]) - raw_throttle)
+        return safe_action, metrics
+
     def collect_rollouts(
         self,
         env: VecEnv,
@@ -417,6 +455,12 @@ class AutoRewardedSAC(SAC):
 
         self._reset_smooth_rollout_cache()
         callback.on_rollout_start()
+        shield_step_count = 0
+        shield_front_brake_count = 0
+        shield_steer_clamp_count = 0
+        shield_raw_safe_diff_steer = []
+        shield_raw_safe_diff_throttle = []
+        shield_episode_intervention_count = 0
 
         while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
             self._append_smooth_observation(self._last_obs)
@@ -435,13 +479,15 @@ class AutoRewardedSAC(SAC):
 
                 if expert_actions_np is not None:
                     actions_np = expert_actions_np
-                    actions_tensor = torch.as_tensor(actions_np, device=self.device)
                     log_probs_np = np.zeros((env.num_envs, 1), dtype=np.float32)
                 else:
                     actions, log_probs = self.actor.action_log_prob(obs_tensor)
                     actions_np = actions.cpu(memory_format=torch.contiguous_format).numpy()
-                    actions_tensor = actions
                     log_probs_np = log_probs.cpu(memory_format=torch.contiguous_format).numpy()
+
+                raw_actions_np = np.array(actions_np, copy=True)
+                actions_np, shield_metrics = self._apply_action_shield(env, actions_np, warmup_phase)
+                actions_tensor = torch.as_tensor(actions_np, device=self.device).float()
                 
                 # Compute learned reward R_omega inline (avoid redundant tensor conversion)
                 r_omega = self.auto_reward_learner.get_reward(features, actions_tensor)
@@ -454,16 +500,28 @@ class AutoRewardedSAC(SAC):
             new_obs, rewards, dones, infos = env.step(actions_np)
             gt_reward = float(rewards[0])
             learned_reward = float(r_omega_val[0])
-            warmstart_ready = self._is_reward_warmstart_ready()
-            train_reward_array = np.array([learned_reward], dtype=np.float32)
+            learned_reward_array = np.array([learned_reward], dtype=np.float32)
             infos[0]["ground_truth_reward"] = gt_reward
             infos[0]["learned_reward"] = learned_reward
-            infos[0]["train_reward"] = learned_reward
-            infos[0]["warmstart_ready"] = warmstart_ready
             infos[0]["warmup_phase"] = float(warmup_phase)
             infos[0]["policy_train_enabled"] = float(not warmup_phase)
             infos[0]["reward_train_enabled"] = float((not warmup_phase) or self.update_reward_learner_during_warmup)
-            infos[0]["expert_bootstrap_active"] = float(use_expert_policy)
+            infos[0]["shield_active"] = shield_metrics["shield_active"]
+            infos[0]["shield_front_brake"] = shield_metrics["shield_front_brake"]
+            infos[0]["shield_steer_clamp"] = shield_metrics["shield_steer_clamp"]
+            infos[0]["shield_raw_safe_diff_steer"] = shield_metrics["raw_safe_diff_steer"]
+            infos[0]["shield_raw_safe_diff_throttle"] = shield_metrics["raw_safe_diff_throttle"]
+            infos[0]["raw_action_steer"] = float(raw_actions_np[0, 0])
+            infos[0]["raw_action_throttle"] = float(raw_actions_np[0, 1])
+            infos[0]["safe_action_steer"] = float(actions_np[0, 0])
+            infos[0]["safe_action_throttle"] = float(actions_np[0, 1])
+
+            shield_step_count += int(shield_metrics["shield_active"])
+            shield_front_brake_count += int(shield_metrics["shield_front_brake"])
+            shield_steer_clamp_count += int(shield_metrics["shield_steer_clamp"])
+            shield_raw_safe_diff_steer.append(shield_metrics["raw_safe_diff_steer"])
+            shield_raw_safe_diff_throttle.append(shield_metrics["raw_safe_diff_throttle"])
+            shield_episode_intervention_count += int(shield_metrics["shield_active"])
             
             # Store for meta-learning (ground truth reward)
             self.auto_reward_learner.store_transition(
@@ -483,6 +541,8 @@ class AutoRewardedSAC(SAC):
                 if done:
                     self._finalize_smooth_episode()
                     self.auto_reward_learner.on_episode_end(success=bool(infos[idx].get("success_state", False)))
+                    infos[idx]["shield_intervention_count"] = shield_episode_intervention_count
+                    shield_episode_intervention_count = 0
                     if infos[idx].get("terminal_observation") is not None:
                         num_collected_episodes += 1
                         self._episode_num += 1
@@ -496,7 +556,7 @@ class AutoRewardedSAC(SAC):
                     self._last_obs,
                     real_next_obs,
                     actions_np,
-                    train_reward_array,
+                    learned_reward_array,
                     dones,
                     infos,
                     track_warmup=self.seed_replay_buffer_from_warmup,
@@ -508,7 +568,7 @@ class AutoRewardedSAC(SAC):
                     self._last_obs,
                     real_next_obs,
                     actions_np,
-                    train_reward_array,
+                    learned_reward_array,
                     dones,
                     infos,
                     track_warmup=False,
@@ -534,6 +594,15 @@ class AutoRewardedSAC(SAC):
             policy_train_enabled=not self._in_expert_warmup_phase(),
             reward_train_enabled=(not self._in_expert_warmup_phase()) or self.update_reward_learner_during_warmup,
         )
+        self.logger.record("shield/active_rate", shield_step_count / max(num_collected_steps, 1))
+        self.logger.record("shield/front_brake_count", shield_front_brake_count)
+        self.logger.record("shield/steer_clamp_count", shield_steer_clamp_count)
+        self.logger.record("shield/mean_action_delta", (
+            np.mean(np.sqrt(np.square(shield_raw_safe_diff_steer) + np.square(shield_raw_safe_diff_throttle)))
+            if shield_raw_safe_diff_steer else 0.0
+        ))
+        self.logger.record("shield/raw_safe_diff_steer", np.mean(shield_raw_safe_diff_steer) if shield_raw_safe_diff_steer else 0.0)
+        self.logger.record("shield/raw_safe_diff_throttle", np.mean(shield_raw_safe_diff_throttle) if shield_raw_safe_diff_throttle else 0.0)
         callback.on_rollout_end()
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=True)
 

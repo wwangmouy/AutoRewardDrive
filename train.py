@@ -18,7 +18,7 @@ parser.add_argument("--fps", type=int, default=15, help="FPS to render the envir
 parser.add_argument("--num_checkpoints", type=int, default=100, help="Checkpoint number")
 parser.add_argument("--log_dir", type=str, default="tensorboard", help="Directory to save logs")
 parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
-parser.add_argument("--config", type=str, default="vlm_rl_ppo", help="Config to use (default: vlm_rl)")
+parser.add_argument("--config", type=str, default="3", help="Config to use (default: 3)")
 
 args = vars(parser.parse_args())
 CONFIG = config.set_config(args["config"])

@@ -370,6 +370,55 @@ class CarlaRouteEnv(gym.Env):
 
         return np.array([steer, throttle_or_brake], dtype=np.float32)
 
+    def _compute_signed_lateral_error(self) -> float:
+        if not hasattr(self, "current_waypoint") or not hasattr(self, "next_waypoint"):
+            return 0.0
+
+        current_loc = vector(self.current_waypoint.transform.location)[:2]
+        next_loc = vector(self.next_waypoint.transform.location)[:2]
+        ego_loc = vector(self.vehicle.get_location())[:2]
+        lane_vec = next_loc - current_loc
+        lane_norm = np.linalg.norm(lane_vec)
+        if lane_norm < 1e-6:
+            return 0.0
+        rel = ego_loc - current_loc
+        signed_cross = lane_vec[0] * rel[1] - lane_vec[1] * rel[0]
+        return float(signed_cross / lane_norm)
+
+    def _get_front_vehicle_distance(self, max_distance=25.0, lateral_threshold=2.5) -> float:
+        ego_transform = self.vehicle.get_transform()
+        ego_loc = vector(ego_transform.location)
+        yaw = np.deg2rad(ego_transform.rotation.yaw)
+        heading = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float32)
+
+        min_distance = float("inf")
+        for actor in self.world.get_actors().filter("vehicle.*"):
+            if actor.id == self.vehicle.id:
+                continue
+            rel = vector(actor.get_location())[:2] - ego_loc[:2]
+            longitudinal = float(np.dot(rel, heading))
+            lateral = float(abs(heading[0] * rel[1] - heading[1] * rel[0]))
+            if longitudinal <= 0.0 or longitudinal > max_distance:
+                continue
+            if lateral > lateral_threshold:
+                continue
+            distance = float(np.linalg.norm(rel))
+            if distance < min_distance:
+                min_distance = distance
+
+        return min_distance
+
+    def get_safety_signals(self, front_scan_distance=25.0, front_lateral_threshold=2.5):
+        return {
+            "speed": float(self.vehicle.get_speed()),
+            "distance_from_center": float(getattr(self, "distance_from_center", 0.0)),
+            "signed_lateral_error": self._compute_signed_lateral_error(),
+            "front_vehicle_distance": self._get_front_vehicle_distance(
+                max_distance=front_scan_distance,
+                lateral_threshold=front_lateral_threshold,
+            ),
+        }
+
     def _set_terminal_state(self, reason):
         if not self.success_state and not self.terminal_state:
             self.terminal_state = True

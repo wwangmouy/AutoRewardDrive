@@ -211,7 +211,7 @@ _CONFIG_3 = {
     "gamma": 0.98,  # Discount factor for AutoReward
     "state": states["5"],
     "action_smoothing": 0.0,
-    "reward_fn": "reward_fn5_simple", # Initial reward fn, will be overridden by AutoReward
+    "reward_fn": "reward_fn_Chen", # Initial reward fn, will be overridden by AutoReward
     "reward_params": reward_params["reward_fn_5_default"],
     "eval_reward_params": reward_params["reward_eval"],
     "obs_res": (80, 120),
@@ -222,7 +222,6 @@ _CONFIG_3 = {
     "use_rgb_bev": False,
     # AutoReward specific parameters
     "reward_update_freq": 2048,  # Frequency of meta-learning updates
-    "n_samples": 1000,  # Number of action samples for reward baseline estimation
     "reward_buffer_size": 100,  # Max number of trajectories in meta-learning buffer
     "train_curriculum": {
         "enabled": True,
@@ -237,16 +236,23 @@ _CONFIG_3 = {
         "warmup_steps": 10000,
         "seed_replay_buffer": True,
         "update_reward_learner_during_warmup": True,
-        "min_success_trajectories": 3,
-        "min_failure_trajectories": 10,
-        "latch_ready": True,
     },
     "policy_smooth_reg": {
         "enabled": True,
         "coef": 0.01,
         "dims": "steer",
-        "source": "recent_rollout",
-        "start_after_timesteps": 100000,
+        "start_after_timesteps": 30000,
+    },
+    "action_shield": {
+        "enabled": True,
+        "apply_during_warmup": False,
+        "apply_during_training": True,
+        "front_distance_threshold": 10.0,
+        "front_speed_threshold": 5.0,
+        "front_scan_distance": 25.0,
+        "front_lateral_threshold": 2.5,
+        "lane_deviation_threshold": 0.8,
+        "brake_strength": 0.5,
     },
 }
 
