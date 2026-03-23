@@ -1,6 +1,7 @@
 import os
 import subprocess
 import time
+import socket
 import gym
 import h5py
 import pygame
@@ -101,6 +102,18 @@ class CarlaRouteEnv(gym.Env):
         "render.modes": ["human", "rgb_array", "rgb_array_no_hud", "state_pixels"]
     }
 
+    @staticmethod
+    def _wait_for_carla_server(host, port, timeout=90.0, poll_interval=1.0):
+        """Wait until CARLA TCP port is reachable."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=2.0):
+                    return True
+            except OSError:
+                time.sleep(poll_interval)
+        return False
+
     def __init__(self, host="127.0.0.1", port=2000,
                  viewer_res=(1120, 560), obs_res=(80, 120),
                  reward_fn=None,
@@ -133,8 +146,11 @@ class CarlaRouteEnv(gym.Env):
             print(" ".join(launch_command))
             self.carla_process = subprocess.Popen(launch_command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
             print("Waiting for CARLA to initialize\n")
-
-            time.sleep(5)
+            if not self._wait_for_carla_server(host, port, timeout=120.0, poll_interval=1.0):
+                raise RuntimeError(
+                    f"CARLA server did not become ready within 120s at {host}:{port}. "
+                    "Please check CARLA logs and GPU/port availability."
+                )
 
         width, height = viewer_res
         if obs_res is None:
@@ -203,8 +219,18 @@ class CarlaRouteEnv(gym.Env):
         self.world = None
         try:
             self.client = carla.Client(host, port)
-            self.client.set_timeout(30.0)  # Increased timeout for map loading
-            self.world = World(self.client, town=town)
+            self.client.set_timeout(120.0)  # Map loading can take >30s on cold start
+
+            last_err = None
+            for _ in range(3):
+                try:
+                    self.world = World(self.client, town=town)
+                    break
+                except RuntimeError as e:
+                    last_err = e
+                    time.sleep(2.0)
+            if self.world is None and last_err is not None:
+                raise last_err
 
             settings = self.world.get_settings()
             settings.fixed_delta_seconds = 1 / self.fps
