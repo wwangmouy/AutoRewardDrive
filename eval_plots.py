@@ -51,8 +51,11 @@ def plot_eval(eval_csv_paths, output_name=None):
 
             # Plot the reward progress
             axs[i][3].plot(episode_df['step'], episode_df['reward'], label=model_id)
+            if 'learned_reward' in episode_df.columns and not episode_df['learned_reward'].isna().all():
+                axs[i][3].plot(episode_df['step'], episode_df['learned_reward'], linestyle='--', alpha=0.7,
+                               label=f"{model_id}-learned")
             axs[i][3].set_xlabel('Step')
-            axs[i, 3].set_ylim(-0.2, 1)  # clip y-axis limits to -1 and 1
+            axs[i, 3].set_ylim(-2.5, 2.5)
 
             axs[i][4].plot(episode_df['step'], episode_df['center_dev'], label=model_id)
             axs[i][4].set_xlabel('Step')
@@ -125,20 +128,53 @@ def summary_eval(eval_csv_path):
     df_collision_interval = df.groupby(['episode'], as_index=False).last()[['episode', 'collision_interval']]
     df_CPS = df.groupby(['episode'], as_index=False).last()[['episode', 'CPS']]
     df_CPM = df.groupby(['episode'], as_index=False).last()[['episode', 'CPM']]
+    optional_frames = []
 
-    # Calculate if the episode was successful based on the distance between waypoints and the vehicle of the last row
+    shield_rate_cols = {
+        'shield_active': 'shield_intervention_rate',
+        'shield_front_brake': 'shield_front_brake_rate',
+        'shield_steer_clamp': 'shield_steer_clamp_rate',
+        'shield_raw_safe_diff_steer': 'shield_raw_safe_diff_steer_mean',
+        'shield_raw_safe_diff_throttle': 'shield_raw_safe_diff_throttle_mean',
+    }
+    available_shield_rate_cols = {k: v for k, v in shield_rate_cols.items() if k in df.columns}
+    if available_shield_rate_cols:
+        df_shield_rates = df.groupby(['episode'], as_index=False)[list(available_shield_rate_cols.keys())].mean()
+        df_shield_rates = df_shield_rates.rename(columns=available_shield_rate_cols)
+        optional_frames.append(df_shield_rates)
 
-    # First from the route dataframe get the last row of each episode
-    df_waypoint = df_route.groupby(['episode'], as_index=False).last()[['episode', 'route_x', 'route_y']]
-    df_success = df.groupby(['episode'], as_index=False).last()[['episode', 'vehicle_location_x', 'vehicle_location_y']]
-    df_success = pd.merge(df_success, df_waypoint, on='episode')
+    shield_last_cols = {
+        'shield_intervention_count': 'shield_intervention_count',
+        'shield_intervention_rate': 'shield_intervention_rate_last',
+        'inference_mode_chunked': 'inference_mode_chunked',
+        'shield_enabled_eval': 'shield_enabled_eval',
+    }
+    available_shield_last_cols = [col for col in shield_last_cols.keys() if col in df.columns]
+    if available_shield_last_cols:
+        df_shield_last = df.groupby(['episode'], as_index=False).last()[['episode'] + available_shield_last_cols]
+        df_shield_last = df_shield_last.rename(columns=shield_last_cols)
+        optional_frames.append(df_shield_last)
 
-    # If the distance between the last waypoint and the vehicle is less than 5 meters, the episode was successful
-    df_success['success'] = df_success.apply(
-        lambda x: eucldist(x['vehicle_location_x'], x['vehicle_location_y'], x['route_x'], x['route_y']) < 5, axis=1)
-    df_success = df_success[['episode', 'success']]
-    # Merge all the dataframes
-    df_summary = pd.merge(df_distance, df_reward, on='episode')
+    if 'success_state' in df.columns:
+        df_success = df.groupby(['episode'], as_index=False).last()[['episode', 'success_state']].rename(
+            columns={'success_state': 'success'}
+        )
+    else:
+        df_waypoint = df_route.groupby(['episode'], as_index=False).last()[['episode', 'route_x', 'route_y']]
+        df_success = df.groupby(['episode'], as_index=False).last()[['episode', 'vehicle_location_x', 'vehicle_location_y']]
+        df_success = pd.merge(df_success, df_waypoint, on='episode')
+        df_success['success'] = df_success.apply(
+            lambda x: eucldist(x['vehicle_location_x'], x['vehicle_location_y'], x['route_x'], x['route_y']) < 5, axis=1)
+        df_success = df_success[['episode', 'success']]
+
+    if 'learned_reward' in df.columns:
+        df_learned_reward = df.groupby(['episode'], as_index=False).sum()[['episode', 'learned_reward']].rename(
+            columns={'learned_reward': 'total_learned_reward'}
+        )
+        df_summary = pd.merge(df_distance, df_reward, on='episode')
+        df_summary = pd.merge(df_summary, df_learned_reward, on='episode')
+    else:
+        df_summary = pd.merge(df_distance, df_reward, on='episode')
     df_summary = pd.merge(df_summary, df_routes_completed, on='episode')
     df_summary = pd.merge(df_summary, df_collision_speed, on='episode')
     df_summary = pd.merge(df_summary, df_collision_interval, on='episode')
@@ -147,6 +183,8 @@ def summary_eval(eval_csv_path):
 
     df_summary = pd.merge(df_summary, df_mean_std, on='episode')
     df_summary = pd.merge(df_summary, df_success, on='episode')
+    for optional_df in optional_frames:
+        df_summary = pd.merge(df_summary, optional_df, on='episode')
 
     # Turn the episode column into a string
     df_summary['episode'] = df_summary['episode'].astype(str)
@@ -156,6 +194,10 @@ def summary_eval(eval_csv_path):
     df_summary.loc['total', 'episode'] = 'total'
     df_summary.loc['total', 'total_reward'] = df_summary['total_reward'].iloc[:-1].sum()
     df_summary.loc['total', 'total_distance'] = df_summary['total_distance'].iloc[:-1].sum()
+    if 'total_learned_reward' in df_summary.columns:
+        df_summary.loc['total', 'total_learned_reward'] = df_summary['total_learned_reward'].iloc[:-1].sum()
+    if 'shield_intervention_count' in df_summary.columns:
+        df_summary.loc['total', 'shield_intervention_count'] = df_summary['shield_intervention_count'].iloc[:-1].sum()
 
     output_path = eval_csv_path.replace("eval.csv", "eval_summary.csv")
     df_summary.to_csv(output_path, index=False)

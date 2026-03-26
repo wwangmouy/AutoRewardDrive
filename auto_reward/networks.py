@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -132,6 +134,74 @@ class ValueFunction(nn.Module):
         value = self.fc3(x)
         return value
     
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+
+class FrozenRewardFeatureEncoderWrapper(nn.Module):
+    """
+    Frozen copy of the policy feature extractor used by reward learning.
+    """
+
+    def __init__(self, feature_extractor: nn.Module):
+        super().__init__()
+        self.feature_extractor = deepcopy(feature_extractor)
+        self.feature_extractor.eval()
+        for param in self.feature_extractor.parameters():
+            param.requires_grad_(False)
+
+    @property
+    def features_dim(self):
+        return getattr(self.feature_extractor, "_features_dim", getattr(self.feature_extractor, "features_dim", None))
+
+    def forward(self, observations):
+        with torch.no_grad():
+            return self.feature_extractor(observations)
+
+
+class RewardNetworkV2(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim + action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self._init_weights()
+
+    def forward(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([features, actions], dim=-1)
+        return self.net(x)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+
+class GTQNetwork(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self._init_weights()
+
+    def forward(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([features, actions], dim=-1)
+        return self.net(x)
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):

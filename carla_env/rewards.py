@@ -18,10 +18,12 @@ reward_functions = {}
 
 def create_reward_fn(reward_fn):
     def func(env):
+        env.reward_components = {}
         if env.terminal_state and reward_fn in {reward_fn5}:
             reward = penalty_reward
         else:
             reward = reward_fn(env)
+        env.reward_components["reward_total"] = float(reward)
 
         terminal_reason = getattr(env, "terminal_reason", "Running...")
         if env.terminal_state:
@@ -351,6 +353,53 @@ def reward_fn_Chen(env):
 
 
 reward_functions["reward_fn_Chen"] = create_reward_fn(reward_fn_Chen)
+
+
+def reward_fn_auto_base(env):
+    angle_to_waypoint = abs(env.vehicle.get_angle(env.current_waypoint))
+    speed_kmh = env.vehicle.get_speed()
+    steer = env.vehicle.get_control().steer
+    prev_steer = float(getattr(env, "prev_steer", 0.0))
+    progress_delta = max(int(env.current_waypoint_index - env.prev_waypoint_index), 0)
+
+    progress = np.clip(progress_delta, 0, 3) / 3.0
+    center = 1.0 - np.clip(env.distance_from_center / 1.75, 0.0, 1.0)
+    heading = 1.0 - np.clip(angle_to_waypoint / np.deg2rad(45.0), 0.0, 1.0)
+    speed = 1.0 - np.clip(abs(speed_kmh - 22.0) / 22.0, 0.0, 1.0)
+    smooth = 1.0 - np.clip(abs(steer - prev_steer) / 0.2, 0.0, 1.0)
+
+    reward = (
+        0.35 * progress
+        + 0.20 * center
+        + 0.15 * heading
+        + 0.20 * speed
+        + 0.10 * smooth
+        - 0.05
+    )
+
+    terminal_bonus = 0.0
+    terminal_reason = getattr(env, "terminal_reason", "")
+    if env.success_state:
+        terminal_bonus = 2.0
+    elif env.collision_state or "Collision" in terminal_reason or terminal_reason == "Off-track":
+        terminal_bonus = -2.0
+    elif terminal_reason in {"Vehicle stopped", "Too fast"}:
+        terminal_bonus = -1.0
+
+    total_reward = float(np.clip(reward + terminal_bonus, -2.0, 2.0))
+    env.reward_components = {
+        "progress": float(progress),
+        "center": float(center),
+        "heading": float(heading),
+        "speed": float(speed),
+        "smooth": float(smooth),
+        "terminal_bonus": float(terminal_bonus),
+        "alive_bonus": -0.05,
+    }
+    return total_reward
+
+
+reward_functions["reward_fn_auto_base"] = create_reward_fn(reward_fn_auto_base)
 
 
 def reward_fn_ASAP(env):

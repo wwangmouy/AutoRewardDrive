@@ -12,9 +12,14 @@ parser.add_argument("--model", type=str, default="./model_400000_steps.zip", hel
 parser.add_argument("--no_render", action="store_false", help="If True, render the environment")
 parser.add_argument("--fps", type=int, default=15, help="FPS to render the environment")
 parser.add_argument("--no_record_video", action="store_false", help="If True, record video of the evaluation")
-parser.add_argument("--config", type=str, default="3", help="Config to use (default: 3)")
+parser.add_argument("--config", type=str, default="4", help="Config to use (default: 4)")
 parser.add_argument("--seed", type=int, default=101, help="random seed")
 parser.add_argument("--device", type=str, default="cuda:0", help="cpu, cuda:0, cuda:1, cuda:2")
+parser.add_argument("--use_shield", action="store_true", help="If True, apply the model safety shield during evaluation")
+parser.add_argument("--inference_mode", choices=["step", "chunked"], default="step",
+                    help="How to execute policy actions during evaluation")
+parser.add_argument("--episodes", type=int, default=10, help="Number of evaluation episodes")
+parser.add_argument("--eval_tag", type=str, default="", help="Optional tag appended to eval outputs")
 parser.add_argument("--density", choices=['empty', 'regular', 'dense'], default="regular",
                     help="different traffic densities")
 parser.add_argument("--town", choices=['Town01', 'Town02', 'Town03', 'Town04', 'Town05'], default="Town02",
@@ -26,7 +31,7 @@ CONFIG.seed = args["seed"]
 CONFIG.algorithm_params.device = args["device"]
 
 from stable_baselines3 import PPO, DDPG, SAC
-from auto_reward.auto_sac import AutoRewardedSAC
+from auto_reward.auto_sac import AutoRewardedSAC, AutoRewardedSACV2
 
 from utils import VideoRecorder, parse_wrapper_class
 from carla_env.state_commons import create_encode_state_fn
@@ -46,19 +51,52 @@ def convert_state(state):
     return c_state
 
 
-def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
+def _default_eval_tag(use_shield, inference_mode):
+    shield_tag = "shielded" if use_shield else "raw"
+    return f"{inference_mode}_{shield_tag}"
+
+
+def _zero_eval_action_metrics(action_np, use_shield, inference_mode):
+    action_arr = np.asarray(action_np, dtype=np.float32).reshape(-1)
+    steer = float(action_arr[0]) if action_arr.size > 0 else 0.0
+    throttle = float(action_arr[1]) if action_arr.size > 1 else 0.0
+    return {
+        "raw_action_steer": steer,
+        "raw_action_throttle": throttle,
+        "safe_action_steer": steer,
+        "safe_action_throttle": throttle,
+        "shield_active": 0.0,
+        "shield_front_brake": 0.0,
+        "shield_steer_clamp": 0.0,
+        "shield_raw_safe_diff_steer": 0.0,
+        "shield_raw_safe_diff_throttle": 0.0,
+        "inference_mode_chunked": float(inference_mode == "chunked"),
+        "shield_enabled_eval": float(use_shield),
+    }
+
+
+def run_eval(env, model, model_path=None, record_video=False, eval_suffix='', use_shield=False, inference_mode='step',
+             episodes=10, eval_tag=''):
     model_name = os.path.basename(model_path)
     log_path = os.path.join(os.path.dirname(model_path), 'eval{}'.format(eval_suffix))
     os.makedirs(log_path, exist_ok=True)
-    video_path = os.path.join(log_path, model_name.replace(".zip", "_eval.avi"))
-    csv_path = os.path.join(log_path, model_name.replace(".zip", "_eval.csv"))
-    model_id = f"{model_path.split('/')[-2]}-{model_name.split('_')[-2]}"
+    file_tag = eval_tag.strip() or _default_eval_tag(use_shield, inference_mode)
+    output_stem = model_name.replace(".zip", f"_{file_tag}")
+    video_path = os.path.join(log_path, output_stem + "_eval.avi")
+    csv_path = os.path.join(log_path, output_stem + "_eval.csv")
+    model_id = output_stem
     state = env.reset()
+    if hasattr(model, "reset_inference_controller"):
+        model.reset_inference_controller()
 
     columns = ["model_id", "episode", "step", "throttle", "steer", "vehicle_location_x", "vehicle_location_y",
-               "reward", "learned_reward", "distance", "speed", "center_dev", "angle_next_waypoint", 
-               "waypoint_x", "waypoint_y", "route_x", "route_y", "routes_completed", 
-               "collision_speed", "collision_interval", "CPS", "CPM"
+               "reward", "learned_reward", "distance", "speed", "center_dev", "angle_next_waypoint",
+               "waypoint_x", "waypoint_y", "route_x", "route_y", "routes_completed", "success_state",
+               "collision_speed", "collision_interval", "CPS", "CPM", "raw_action_steer", "raw_action_throttle",
+               "safe_action_steer", "safe_action_throttle", "shield_active", "shield_front_brake",
+               "shield_steer_clamp", "shield_raw_safe_diff_steer", "shield_raw_safe_diff_throttle",
+               "shield_intervention_count", "shield_intervention_rate", "inference_mode_chunked",
+               "shield_enabled_eval"
                ]
     df = pd.DataFrame(columns=columns)
     
@@ -78,13 +116,27 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
         video_recorder = None
 
     episode_idx = 0
+    episode_shield_intervention_count = 0
     # While non-terminal state
     print("Episode ", episode_idx)
     saved_route = False
-    while episode_idx < 10:
+    while episode_idx < episodes:
         env.extra_info.append("Evaluation")
-        action, _states = model.predict(state, deterministic=True)
+        current_state = state
+        if hasattr(model, "get_eval_action"):
+            action, eval_action_metrics = model.get_eval_action(
+                current_state,
+                env,
+                deterministic=True,
+                use_shield=use_shield,
+                inference_mode=inference_mode,
+            )
+        else:
+            action, _states = model.predict(current_state, deterministic=True)
+            eval_action_metrics = _zero_eval_action_metrics(action, use_shield=use_shield, inference_mode=inference_mode)
+        action_np = np.asarray(action, dtype=np.float32).reshape(-1)
         next_state, reward, dones, info = env.step(action)
+        episode_shield_intervention_count += int(eval_action_metrics["shield_active"])
 
         state = next_state
         if env.step_count >= 150 and env.current_waypoint_index == 0:
@@ -116,23 +168,10 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
         
         # Compute learned reward for AutoReward models
         learned_reward = None
-        if has_auto_reward:
-            with torch.no_grad():
-                # Prepare full observation dict for features extractor
-                obs_dict = {}
-                obs_dict['seg_camera'] = torch.as_tensor(state['seg_camera']).to(model.device).float().permute(2, 0, 1).unsqueeze(0)
-                obs_dict['vehicle_measures'] = torch.as_tensor(state['vehicle_measures']).to(model.device).float().unsqueeze(0)
-                obs_dict['waypoints'] = torch.as_tensor(state['waypoints']).to(model.device).float().unsqueeze(0)
-                
-                # Extract features using the actor's feature extractor
-                features = model.actor.extract_features(
-                    obs_dict,
-                    model.actor.features_extractor
-                )
-                action_tensor = torch.as_tensor(action).to(model.device).float().unsqueeze(0)
-                r_omega = model.auto_reward_learner.get_reward(features, action_tensor)
-                learned_reward = float(r_omega.cpu().numpy().flatten()[0])
+        if has_auto_reward and hasattr(model, "compute_current_learned_reward"):
+            learned_reward = float(model.compute_current_learned_reward(current_state, action_np)[0])
         
+        shield_intervention_rate = episode_shield_intervention_count / max(env.step_count, 1)
         
         new_row = pd.DataFrame(
             [[model_id, env.episode_idx, env.step_count, env.vehicle.control.throttle, env.vehicle.control.steer,
@@ -141,7 +180,14 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
               env.vehicle.get_speed(), env.distance_from_center,
               np.rad2deg(env.vehicle.get_angle(env.current_waypoint)),
               waypoint_relative[0], waypoint_relative[1], None, None,
-              env.routes_completed, collision_speed, collision_interval, cps, cpm
+              env.routes_completed, float(info.get("success_state", False)), collision_speed, collision_interval, cps, cpm,
+              eval_action_metrics["raw_action_steer"], eval_action_metrics["raw_action_throttle"],
+              eval_action_metrics["safe_action_steer"], eval_action_metrics["safe_action_throttle"],
+              eval_action_metrics["shield_active"], eval_action_metrics["shield_front_brake"],
+              eval_action_metrics["shield_steer_clamp"], eval_action_metrics["shield_raw_safe_diff_steer"],
+              eval_action_metrics["shield_raw_safe_diff_throttle"], episode_shield_intervention_count,
+              shield_intervention_rate, eval_action_metrics["inference_mode_chunked"],
+              eval_action_metrics["shield_enabled_eval"]
               ]], columns=columns)
         df = pd.concat([df, new_row], ignore_index=True)
 
@@ -151,7 +197,10 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
             video_recorder.add_frame(rendered_frame)
         if dones:
             state = env.reset()
+            if hasattr(model, "reset_inference_controller"):
+                model.reset_inference_controller()
             episode_idx += 1
+            episode_shield_intervention_count = 0
             saved_route = False
             print("Episode ", episode_idx)
 
@@ -172,6 +221,7 @@ if __name__ == "__main__":
         "DDPG": DDPG,
         "SAC": SAC,
         "SAC_AUTO": AutoRewardedSAC,
+        "SAC_AUTO_V2": AutoRewardedSACV2,
     }
     if CONFIG.algorithm not in algorithm_dict:
         raise ValueError("Invalid algorithm name")
@@ -181,25 +231,27 @@ if __name__ == "__main__":
     observation_space, encode_state_fn = create_encode_state_fn(CONFIG.state, CONFIG)
     action_space_type = 'continuous' if CONFIG.action_space_type != 'discrete' else 'discrete'
 
-    eval_suffix = ''
+    eval_tags = []
     if args['density'] == 'empty':
         activate_traffic_flow = False
         tf_num = 0
-        eval_suffix += 'empty'
+        eval_tags.append('empty')
     else:
         activate_traffic_flow = True
         if args['density'] == 'regular':
             tf_num = 20
         else:
             tf_num = 40
-            eval_suffix += 'dense'
+            eval_tags.append('dense')
     if args['town'] != 'Town02':
-        eval_suffix += args['town']
+        eval_tags.append(args['town'])
+    eval_suffix = "" if not eval_tags else "_" + "_".join(eval_tags)
 
     env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
                         reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
                         encode_state_fn=encode_state_fn, fps=args["fps"], action_smoothing=CONFIG.action_smoothing,
-                        eval=True, action_space_type=action_space_type, activate_spectator=True, activate_render=True,
+                        eval=True, action_space_type=action_space_type,
+                        activate_spectator=args["no_render"], activate_render=args["no_render"],
                         activate_bev=True, activate_seg_bev=CONFIG.use_seg_bev, start_carla=True,
                         activate_traffic_flow=activate_traffic_flow, tf_num=tf_num, town=args["town"])
 
@@ -208,13 +260,26 @@ if __name__ == "__main__":
         env = wrap_class(env, *wrap_params)
 
     # Load the model based on the algorithm type
-    if CONFIG.algorithm == "SAC_AUTO":
-        model = AutoRewardedSAC.load(model_ckpt, env=env, config=CONFIG, device=args["device"])
+    if CONFIG.algorithm in {"SAC_AUTO", "SAC_AUTO_V2"}:
+        if CONFIG.algorithm == "SAC_AUTO":
+            model = AutoRewardedSAC.load(model_ckpt, env=env, config=CONFIG, device=args["device"])
+        else:
+            model = AutoRewardedSACV2.load(model_ckpt, env=env, config=CONFIG, device=args["device"])
     else:
         model = AlgorithmRL.load(model_ckpt, env=env, device=args["device"])
 
     print("Model loaded successfully...")
 
-    run_eval(env, model, model_ckpt, record_video=args["no_record_video"], eval_suffix=eval_suffix)
+    run_eval(
+        env,
+        model,
+        model_ckpt,
+        record_video=args["no_record_video"],
+        eval_suffix=eval_suffix,
+        use_shield=args["use_shield"],
+        inference_mode=args["inference_mode"],
+        episodes=args["episodes"],
+        eval_tag=args["eval_tag"],
+    )
 
     env.close()

@@ -148,6 +148,25 @@ algorithm_params = {
             features_extractor_kwargs=dict(features_dim=256),
         ),
     ),
+    "SAC_AUTO_V2": dict(
+        device="cuda:0",
+        learning_rate=lr_schedule(3e-4, 1e-6, 2),
+        buffer_size=100000,
+        batch_size=128,
+        ent_coef="auto",
+        gamma=0.98,
+        tau=0.02,
+        train_freq=64,
+        gradient_steps=64,
+        learning_starts=2048,
+        use_sde=True,
+        policy_kwargs=dict(
+            log_std_init=-1,
+            net_arch=[400, 300],
+            features_extractor_class=CustomMultiInputExtractor,
+            features_extractor_kwargs=dict(features_dim=256),
+        ),
+    ),
 }
 
 states = {
@@ -265,10 +284,131 @@ _CONFIG_3 = {
     },
 }
 
+_CONFIG_4 = {
+    "algorithm": "SAC_AUTO_V2",
+    "algorithm_params": algorithm_params["SAC_AUTO_V2"],
+    "gamma": 0.98,
+    "state": states["5"],
+    "action_smoothing": 0.0,
+    "reward_fn": "reward_fn_auto_base",
+    "reward_params": reward_params["reward_fn_5_default"],
+    "eval_reward_params": reward_params["reward_eval"],
+    "obs_res": (80, 120),
+    "seed": 100,
+    "wrappers": [],
+    "action_noise": {},
+    "use_seg_bev": True,
+    "use_rgb_bev": False,
+    "reward_model": {
+        "hidden_dim": 256,
+        "reward_lr": 1e-4,
+        "gt_q_lr": 3e-4,
+        "tau": 0.01,
+    },
+    "policy_bootstrap": {
+        "pure_expert_steps": 10000,
+        "mixed_expert_steps": 10000,
+        "bc_start_steps": 2000,
+        "bc_end_steps": 50000,
+        "bc_coef_start": 1.0,
+        "expert_mix_end_ratio": 0.0,
+        "expert_buffer_capacity": 1024,
+        "expert_buffer_batch_size": 64,
+    },
+    "reward_schedule": {
+        "blend_start_steps": 20000,
+        "blend_end_steps": 50000,
+        "reward_ready_corr_threshold": 0.2,
+        "reward_ready_env_weight_floor": 0.3,
+    },
+    "meta_optimizer": {
+        "update_freq": 1024,
+        "start_steps": 20000,
+        "inner_steps": 2,
+        "meta_batch_size": 16,
+        "rank_margin": 0.5,
+        "terminal_margin": 0.5,
+        "rank_coef": 0.5,
+        "terminal_coef": 0.1,
+        "reward_l2_coef": 1e-4,
+        "inner_reward_coef": 1.0,
+        "inner_rank_coef": 0.25,
+        "inner_terminal_coef": 0.1,
+        "action_step_size": 0.1,
+        "reward_train_capacity": 200,
+        "meta_eval_capacity": 64,
+        "min_success_episodes": 8,
+        "min_failure_episodes": 8,
+    },
+    "policy_smooth_reg": {
+        "enabled": True,
+        "coef": 0.01,
+        "dims": "steer",
+        "start_after_timesteps": 20000,
+    },
+    "shield_guidance": {
+        "enabled": True,
+        "buffer_capacity": 8192,
+        "batch_size": 64,
+        "bc_coef": 0.25,
+        "start_after_timesteps": 10000,
+        "intervention_penalty": 0.1,
+    },
+    "inference_chunk": {
+        "enabled": True,
+        "chunk_len": 3,
+        "default_mode": "step",
+    },
+    "train_curriculum": {
+        "enabled": True,
+        "phases": [
+            {"episode_end": -1, "min_waypoints": 20, "max_waypoints": 60, "tf_num": 0},
+            {"episode_end": -1, "min_waypoints": 60, "max_waypoints": 120, "tf_num": 10},
+            {"episode_end": -1, "min_waypoints": 120, "max_waypoints": None, "tf_num": 20},
+        ],
+    },
+    "curriculum_thresholds": {
+        "window": 50,
+        "success_hysteresis": 0.05,
+        "route_hysteresis": 0.05,
+        "phases": [
+            {"phase_index": 0, "min_success_rate": 0.0, "min_route_completion": 0.0},
+            {"phase_index": 1, "min_success_rate": 0.30, "min_route_completion": 0.45},
+            {"phase_index": 2, "min_success_rate": 0.60, "min_route_completion": 0.80},
+        ],
+    },
+    "action_shield": {
+        "train_enabled": True,
+        "eval_enabled": True,
+        "front_distance_threshold": 10.0,
+        "front_speed_threshold": 5.0,
+        "front_scan_distance": 25.0,
+        "front_lateral_threshold": 2.5,
+        "lane_deviation_threshold": 0.8,
+        "brake_strength": 0.5,
+    },
+}
+
+_CONFIG_5 = {
+    "algorithm": "SAC",
+    "algorithm_params": algorithm_params["SAC"],
+    "state": states["5"],
+    "action_smoothing": 0.0,
+    "reward_fn": "reward_fn_auto_base",
+    "reward_params": reward_params["reward_fn_5_default"],
+    "obs_res": (80, 120),
+    "seed": 42,
+    "wrappers": [],
+    "use_seg_bev": True,
+    "use_rgb_bev": False,
+}
+
 CONFIGS = {
     "1": _CONFIG_1,
     "2": _CONFIG_2,
     "3": _CONFIG_3,
+    "4": _CONFIG_4,
+    "5": _CONFIG_5,
 }
 
 CONFIG = None

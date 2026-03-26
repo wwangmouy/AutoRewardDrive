@@ -139,7 +139,8 @@ class CarlaRouteEnv(gym.Env):
             launch_command += ['-quality_level=Low']
             launch_command += ['-benchmark']
             launch_command += ["-fps=%i" % fps]
-            launch_command += ['-RenderOffScreen']
+            if not activate_render:
+                launch_command += ['-RenderOffScreen']
             launch_command += ['-prefernvidia']
             launch_command += [f'-carla-world-port={port}']
             print("Running command:")
@@ -183,6 +184,7 @@ class CarlaRouteEnv(gym.Env):
         self.eval = eval
         self.activate_traffic_flow = activate_traffic_flow
         self.train_curriculum = CONFIG.get("train_curriculum", {})
+        self.curriculum_phase_override = None
         self.base_tf_num = tf_num
         self.tf_num = tf_num
         self.traffic_flow_vehicles = []
@@ -321,10 +323,17 @@ class CarlaRouteEnv(gym.Env):
         self.distance_traveled = 0.0
         self.center_lane_deviation = 0.0
         self.speed_accum = 0.0
+        self.collision_num = 0
+        self.cps = 0
+        self.cpm = 0
+        self.collision_interval = 0
+        self.collision_speed = 0.0
         self.routes_completed = 0.0
         self.low_speed_timer = 0.0
         self.collision = False
         self.action_list = []
+        self.prev_steer = 0.0
+        self.reward_components = {}
         self.expert_controller = VehiclePIDController(
             self.vehicle,
             args_lateral={'K_P': 1.6, 'K_D': 0.05, 'K_I': 0.2, 'dt': 1.0 / self.fps},
@@ -342,12 +351,33 @@ class CarlaRouteEnv(gym.Env):
         if self.eval or not self.train_curriculum or not self.train_curriculum.get("enabled", False):
             return None
 
+        phases = self.train_curriculum.get("phases", [])
+        if self.curriculum_phase_override is not None:
+            if 0 <= int(self.curriculum_phase_override) < len(phases):
+                return phases[int(self.curriculum_phase_override)]
+            return None
+
         episode_num = max(self.episode_idx, 0)
-        for phase in self.train_curriculum.get("phases", []):
+        for phase in phases:
             episode_end = phase.get("episode_end", -1)
             if episode_end == -1 or episode_num < episode_end:
                 return phase
         return None
+
+    def get_curriculum_phase_index(self):
+        if self.eval or not self.train_curriculum or not self.train_curriculum.get("enabled", False):
+            return -1
+        if self.curriculum_phase_override is not None:
+            return int(self.curriculum_phase_override)
+        episode_num = max(self.episode_idx, 0)
+        for idx, phase in enumerate(self.train_curriculum.get("phases", [])):
+            episode_end = phase.get("episode_end", -1)
+            if episode_end == -1 or episode_num < episode_end:
+                return idx
+        return len(self.train_curriculum.get("phases", [])) - 1
+
+    def set_curriculum_phase(self, phase_index):
+        self.curriculum_phase_override = None if phase_index is None else int(phase_index)
 
     @staticmethod
     def _route_length_score(route_length, min_waypoints, max_waypoints):
@@ -534,6 +564,13 @@ class CarlaRouteEnv(gym.Env):
     def close(self):
         if self.carla_process:
             self.carla_process.terminate()
+            try:
+                self.carla_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.carla_process.kill()
+                self.carla_process.wait(timeout=5)
+            finally:
+                self.carla_process = None
         pygame.quit()
         if self.world is not None:
             self.world.destroy()
@@ -613,6 +650,7 @@ class CarlaRouteEnv(gym.Env):
             elif self.action_space_type == "discrete":
                 throttle, steer = discrete_actions[int(action)]
 
+            self.prev_steer = float(self.vehicle.control.steer)
             if self.action_smoothing > 0.0:
                 self.vehicle.control.steer = smooth_action(self.vehicle.control.steer, steer, self.action_smoothing)
             else:
@@ -761,7 +799,11 @@ class CarlaRouteEnv(gym.Env):
             "collision_rate": sum(self.collision_deque) / len(self.collision_deque) if self.collision_deque else 0.0,
             "episode_length": self.step_count,
             "collision_state": self.collision_state,
+            "curriculum_phase": self.get_curriculum_phase_index(),
+            "reward_components": dict(getattr(self, "reward_components", {})),
         }
+        for key, value in getattr(self, "reward_components", {}).items():
+            info[f"reward_{key}"] = value
 
         if self.terminal_state or self.success_state:
             if self.collision_state:
