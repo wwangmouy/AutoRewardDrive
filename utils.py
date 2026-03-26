@@ -127,6 +127,12 @@ class TensorboardCallback(BaseCallback):
             self.logger.record("custom/collision_rate", self.locals['infos'][0]['collision_rate'])
             self.logger.record("custom/collision_num", self.locals['infos'][0]['collision_num'])
             self.logger.record("custom/episode_length", self.locals['infos'][0]['episode_length'])
+            if 'raw_action_delta' in self.locals['infos'][0]:
+                self.logger.record("custom/raw_action_delta", self.locals['infos'][0]['raw_action_delta'])
+            if 'executed_action_delta' in self.locals['infos'][0]:
+                self.logger.record("custom/executed_action_delta", self.locals['infos'][0]['executed_action_delta'])
+            if 'chunk_reuse_ratio' in self.locals['infos'][0]:
+                self.logger.record("custom/chunk_reuse_ratio", self.locals['infos'][0]['chunk_reuse_ratio'])
             if self.locals['infos'][0]['collision_state']:
                 self.logger.record("custom/CPS", self.locals['infos'][0]['CPS'])
                 self.logger.record("custom/CPM", self.locals['infos'][0]['CPM'])

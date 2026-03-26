@@ -54,9 +54,12 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
     csv_path = os.path.join(log_path, model_name.replace(".zip", "_eval.csv"))
     model_id = f"{model_path.split('/')[-2]}-{model_name.split('_')[-2]}"
     state = env.reset()
+    if hasattr(model, "reset_chunk_state"):
+        model.reset_chunk_state()
 
     columns = ["model_id", "episode", "step", "throttle", "steer", "vehicle_location_x", "vehicle_location_y",
-               "reward", "learned_reward", "distance", "speed", "center_dev", "angle_next_waypoint", 
+               "reward", "learned_reward", "distance", "speed", "center_dev", "angle_next_waypoint",
+               "raw_steer", "raw_longitudinal", "executed_steer", "executed_longitudinal",
                "waypoint_x", "waypoint_y", "route_x", "route_y", "routes_completed", 
                "collision_speed", "collision_interval", "CPS", "CPM"
                ]
@@ -83,6 +86,7 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
     saved_route = False
     while episode_idx < 10:
         env.extra_info.append("Evaluation")
+        current_state = state
         action, _states = model.predict(state, deterministic=True)
         next_state, reward, dones, info = env.step(action)
 
@@ -120,19 +124,22 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
             with torch.no_grad():
                 # Prepare full observation dict for features extractor
                 obs_dict = {}
-                obs_dict['seg_camera'] = torch.as_tensor(state['seg_camera']).to(model.device).float().permute(2, 0, 1).unsqueeze(0)
-                obs_dict['vehicle_measures'] = torch.as_tensor(state['vehicle_measures']).to(model.device).float().unsqueeze(0)
-                obs_dict['waypoints'] = torch.as_tensor(state['waypoints']).to(model.device).float().unsqueeze(0)
+                obs_dict['seg_camera'] = torch.as_tensor(current_state['seg_camera']).to(model.device).float().permute(2, 0, 1).unsqueeze(0)
+                obs_dict['vehicle_measures'] = torch.as_tensor(current_state['vehicle_measures']).to(model.device).float().unsqueeze(0)
+                obs_dict['waypoints'] = torch.as_tensor(current_state['waypoints']).to(model.device).float().unsqueeze(0)
                 
                 # Extract features using the actor's feature extractor
                 features = model.actor.extract_features(
                     obs_dict,
                     model.actor.features_extractor
                 )
-                action_tensor = torch.as_tensor(action).to(model.device).float().unsqueeze(0)
+                executed_action = np.asarray(info.get('executed_action', action), dtype=np.float32)
+                action_tensor = torch.as_tensor(executed_action).to(model.device).float().unsqueeze(0)
                 r_omega = model.auto_reward_learner.get_reward(features, action_tensor)
                 learned_reward = float(r_omega.cpu().numpy().flatten()[0])
-        
+
+        raw_action = np.asarray(getattr(model, 'last_raw_action', action), dtype=np.float32)
+        executed_action = np.asarray(info.get('executed_action', action), dtype=np.float32)
         
         new_row = pd.DataFrame(
             [[model_id, env.episode_idx, env.step_count, env.vehicle.control.throttle, env.vehicle.control.steer,
@@ -140,6 +147,7 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
               env.distance_traveled,
               env.vehicle.get_speed(), env.distance_from_center,
               np.rad2deg(env.vehicle.get_angle(env.current_waypoint)),
+              raw_action[0], raw_action[1], executed_action[0], executed_action[1],
               waypoint_relative[0], waypoint_relative[1], None, None,
               env.routes_completed, collision_speed, collision_interval, cps, cpm
               ]], columns=columns)
@@ -150,6 +158,8 @@ def run_eval(env, model, model_path=None, record_video=False, eval_suffix=''):
             rendered_frame = env.render(mode="rgb_array")
             video_recorder.add_frame(rendered_frame)
         if dones:
+            if hasattr(model, "reset_chunk_state"):
+                model.reset_chunk_state()
             state = env.reset()
             episode_idx += 1
             saved_route = False
@@ -199,6 +209,7 @@ if __name__ == "__main__":
     env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"],
                         reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
                         encode_state_fn=encode_state_fn, fps=args["fps"], action_smoothing=CONFIG.action_smoothing,
+                        action_postprocess_config=CONFIG.get("action_postprocess", None),
                         eval=True, action_space_type=action_space_type, activate_spectator=True, activate_render=True,
                         activate_bev=True, activate_seg_bev=CONFIG.use_seg_bev, start_carla=True,
                         activate_traffic_flow=activate_traffic_flow, tf_num=tf_num, town=args["town"])

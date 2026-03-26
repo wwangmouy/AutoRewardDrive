@@ -139,7 +139,7 @@ algorithm_params = {
         tau=0.02,
         train_freq=64,
         gradient_steps=64,
-        learning_starts=5000,
+        learning_starts=10000,
         use_sde=True,
         policy_kwargs=dict(
             log_std_init=-1,  # Higher initial std for more exploration (exp(-1) ≈ 0.37)
@@ -226,10 +226,57 @@ _CONFIG_3 = {
     "reward_buffer_size": 100,  # Max number of trajectories in meta-learning buffer
 }
 
+_CONFIG_4 = {
+    "algorithm": "SAC_AUTO",
+    "algorithm_params": algorithm_params["SAC_AUTO"],
+    "gamma": 0.98,
+    "state": states["5"],
+    "action_smoothing": 0.75,
+    "reward_fn": "reward_fn_Chen",
+    "reward_params": reward_params["reward_fn_5_default"],
+    "eval_reward_params": reward_params["reward_eval"],
+    "obs_res": (80, 120),
+    "seed": 100,
+    "wrappers": [],
+    "action_noise": {},
+    "use_seg_bev": True,
+    "use_rgb_bev": False,
+    "reward_update_freq": 2048,
+    "n_samples": 1000,
+    "reward_buffer_size": 100,
+    "action_postprocess": {
+        "ema": {
+            "steer": 0.75,
+            "longitudinal": 0.50,
+        },
+        "delta_limit": {
+            "enabled": False,
+            "steer": 0.20,
+            "longitudinal": 0.20,
+        },
+    },
+    "chunk": {
+        "enabled": True,
+        "len": 3,
+        "mode": "hold",
+    },
+    "chunk_train": {
+        "actor_lambda": 0.08,
+        "critic_lambda": 0.50,
+        "sample_windows": 16,
+        "buffer_size": 2048,
+        "action_weights": {
+            "steer": 1.0,
+            "longitudinal": 0.5,
+        },
+    },
+}
+
 CONFIGS = {
     "1": _CONFIG_1,
     "2": _CONFIG_2,
     "3": _CONFIG_3,
+    "4": _CONFIG_4,
 }
 
 CONFIG = None
@@ -239,4 +286,3 @@ def set_config(config_name):
     global CONFIG
     CONFIG = Box(CONFIGS[config_name], default_box=True)
     return CONFIG
-

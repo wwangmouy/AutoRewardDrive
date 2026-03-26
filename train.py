@@ -51,6 +51,7 @@ env = CarlaRouteEnv(obs_res=CONFIG.obs_res, host=args["host"], port=args["port"]
                     reward_fn=reward_functions[CONFIG.reward_fn], observation_space=observation_space,
                     encode_state_fn=encode_state_fn, fps=args["fps"],
                     action_smoothing=CONFIG.action_smoothing, action_space_type=action_space_type,
+                    action_postprocess_config=CONFIG.get("action_postprocess", None),
                     activate_spectator=args["no_render"], activate_render=args["no_render"],
                     activate_bev=CONFIG.use_rgb_bev, activate_seg_bev=CONFIG.use_seg_bev,
                     activate_traffic_flow=True, start_carla=args["start_carla"],

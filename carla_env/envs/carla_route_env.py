@@ -106,6 +106,7 @@ class CarlaRouteEnv(gym.Env):
                  observation_space=None,
                  encode_state_fn=None,
                  fps=15, action_smoothing=0.0,
+                 action_postprocess_config=None,
                  action_space_type="continuous",
                  activate_spectator=True,
                  activate_bev=False,
@@ -157,6 +158,7 @@ class CarlaRouteEnv(gym.Env):
         self.fps = fps
         self.action_smoothing = action_smoothing
         self.episode_idx = -2
+        self._configure_action_postprocess(action_postprocess_config)
 
         self.encode_state_fn = (lambda x: x) if not callable(encode_state_fn) else encode_state_fn
         self.reward_fn = (lambda x: 0) if not callable(reward_fn) else reward_fn
@@ -262,6 +264,71 @@ class CarlaRouteEnv(gym.Env):
         # Reset env to set initial state
         self.reset()
 
+    def _configure_action_postprocess(self, action_postprocess_config):
+        action_postprocess_config = action_postprocess_config or {}
+        ema_config = action_postprocess_config.get("ema", {}) if hasattr(action_postprocess_config, "get") else {}
+        delta_limit_config = action_postprocess_config.get("delta_limit", {}) if hasattr(action_postprocess_config, "get") else {}
+
+        self.steer_ema = float(ema_config.get("steer", self.action_smoothing))
+        self.longitudinal_ema = float(ema_config.get("longitudinal", 0.0))
+        self.delta_limit_enabled = bool(delta_limit_config.get("enabled", False))
+        self.delta_limit_steer = float(delta_limit_config.get("steer", 1.0))
+        self.delta_limit_longitudinal = float(delta_limit_config.get("longitudinal", 1.0))
+        self._reset_action_postprocess_state()
+
+    def _reset_action_postprocess_state(self):
+        self._last_requested_action = None
+        self._last_executed_action = np.zeros(2, dtype=np.float32)
+        self._executed_action_delta_sum = 0.0
+        self._executed_action_delta_count = 0
+        self._latest_applied_throttle = 0.0
+        self._latest_applied_brake = 0.0
+
+    def _apply_action_postprocess(self, action):
+        requested_action = np.asarray(action, dtype=np.float32).copy()
+        requested_action = np.clip(requested_action, self.action_space.low, self.action_space.high)
+
+        previous_executed = self._last_executed_action.copy()
+        steer = float(smooth_action(previous_executed[0], requested_action[0], self.steer_ema))
+        longitudinal = float(
+            smooth_action(previous_executed[1], requested_action[1], self.longitudinal_ema)
+            if self.longitudinal_ema > 0
+            else requested_action[1]
+        )
+
+        if self.delta_limit_enabled:
+            steer = float(np.clip(
+                steer,
+                previous_executed[0] - self.delta_limit_steer,
+                previous_executed[0] + self.delta_limit_steer,
+            ))
+            longitudinal = float(np.clip(
+                longitudinal,
+                previous_executed[1] - self.delta_limit_longitudinal,
+                previous_executed[1] + self.delta_limit_longitudinal,
+            ))
+
+        executed_action = np.array([steer, longitudinal], dtype=np.float32)
+        executed_action = np.clip(executed_action, self.action_space.low, self.action_space.high)
+
+        if executed_action[1] >= 0:
+            throttle = float(executed_action[1])
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = float(-executed_action[1])
+
+        if self._last_requested_action is not None:
+            self._executed_action_delta_sum += float(np.linalg.norm(executed_action - previous_executed))
+            self._executed_action_delta_count += 1
+
+        self._last_requested_action = requested_action
+        self._last_executed_action = executed_action
+        self._latest_applied_throttle = throttle
+        self._latest_applied_brake = brake
+
+        return requested_action, executed_action, throttle, brake
+
     def reset(self, is_training=False):
         # Create new route
         self.num_routes_completed = -1
@@ -292,6 +359,7 @@ class CarlaRouteEnv(gym.Env):
         self.low_speed_timer = 0.0
         self.collision = False
         self.action_list = []
+        self._reset_action_postprocess_state()
         self.world.tick()
 
         time.sleep(0.2)
@@ -309,7 +377,9 @@ class CarlaRouteEnv(gym.Env):
 
         self.vehicle.control.steer = float(0.0)
         self.vehicle.control.throttle = float(0.0)
+        self.vehicle.control.brake = float(0.0)
         self.vehicle.set_simulate_physics(False)
+        self._reset_action_postprocess_state()
 
         if not self.eval:
             if self.episode_idx % 2 == 0 and self.num_routes_completed == -1:
@@ -425,6 +495,8 @@ class CarlaRouteEnv(gym.Env):
         if self.closed:
             raise Exception("CarlaEnv.step() called after the environment was closed." +
                             "Check for info[\"closed\"] == True in the learning loop.")
+        requested_action = None
+        executed_action = self._last_executed_action.copy()
         if action is not None:
             if self.current_waypoint_index >= len(self.route_waypoints) - 1:
                 if not self.eval:
@@ -433,17 +505,24 @@ class CarlaRouteEnv(gym.Env):
                     self.success_state = True
 
             if self.action_space_type == "continuous":
-                steer, throttle = [float(a) for a in action]
+                requested_action, executed_action, throttle, brake = self._apply_action_postprocess(action)
             elif self.action_space_type == "discrete":
                 throttle, steer = discrete_actions[int(action)]
+                requested_action = np.array([steer, throttle], dtype=np.float32)
+                executed_action = requested_action.copy()
+                brake = float(-throttle) if throttle < 0 else 0.0
+                throttle = float(max(throttle, 0.0))
+                if self._last_requested_action is not None:
+                    self._executed_action_delta_sum += float(np.linalg.norm(executed_action - self._last_executed_action))
+                    self._executed_action_delta_count += 1
+                self._last_requested_action = requested_action.copy()
+                self._last_executed_action = executed_action.copy()
+                self._latest_applied_throttle = throttle
+                self._latest_applied_brake = brake
 
-            self.vehicle.control.steer = smooth_action(self.vehicle.control.steer, steer, self.action_smoothing)
-            if throttle >= 0:
-                self.vehicle.control.throttle = throttle
-                self.vehicle.control.brake = 0
-            else:
-                self.vehicle.control.throttle = 0
-                self.vehicle.control.brake = -throttle
+            self.vehicle.control.steer = float(executed_action[0] if self.action_space_type == "continuous" else steer)
+            self.vehicle.control.throttle = float(throttle)
+            self.vehicle.control.brake = float(brake)
             self.action_list.append(self.vehicle.control.steer)
         self.world.tick()
 
@@ -566,7 +645,18 @@ class CarlaRouteEnv(gym.Env):
             "collision_rate": sum(self.collision_deque) / len(self.collision_deque) if self.collision_deque else 0.0,
             "episode_length": self.step_count,
             "collision_state": self.collision_state,
+            "executed_action": executed_action.copy(),
+            "applied_steer": float(self.vehicle.control.steer),
+            "applied_throttle": float(self._latest_applied_throttle),
+            "applied_brake": float(self._latest_applied_brake),
+            "executed_action_delta": (
+                self._executed_action_delta_sum / self._executed_action_delta_count
+                if self._executed_action_delta_count
+                else 0.0
+            ),
         }
+        if requested_action is not None:
+            info["requested_action"] = requested_action.copy()
 
         if self.terminal_state or self.success_state:
             if self.collision_state:
@@ -844,4 +934,3 @@ class CarlaRouteEnv(gym.Env):
 
 if __name__ == "__main__":
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-

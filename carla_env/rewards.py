@@ -363,7 +363,7 @@ def reward_fn_Chen(env):
     r_collision = -1 if collision else 0
     v_lon = speed  # Longitudinal speed
     r_fast = -1 if speed > 8 else 0  # Penalty for exceeding 8 m/s
-    r_out = -1 if env.distance_from_center > 4 else 0  # Penalty for leaving lane (assuming 4m threshold)
+    r_out = -1 if env.distance_from_center > 2 else 0  # Penalty for leaving lane (assuming 2 threshold)
     alpha_squared = -5 * (steering ** 2)  # Quadratic steering penalty
     r_lat = -abs(steering) * (speed ** 2)  # Lateral acceleration penalty
     constant_term = -0.1  # Constant penalty
